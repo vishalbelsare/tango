@@ -9,7 +9,12 @@ Base class
    :special-members:
    :exclude-members: from_params
 
+.. autofunction:: tango.step.step
+
 .. autoclass:: tango.step.WithUnresolvedSteps
+   :members:
+
+.. autoclass:: tango.step.StepResources
    :members:
 
 Implementations

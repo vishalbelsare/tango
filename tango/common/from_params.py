@@ -20,7 +20,7 @@ from typing import (
     get_type_hints,
 )
 
-from tango.common.det_hash import CustomDetHash
+from tango.common.det_hash import DetHashWithVersion
 from tango.common.exceptions import ConfigurationError
 from tango.common.lazy import Lazy
 from tango.common.params import Params
@@ -112,7 +112,7 @@ def remove_optional(annotation: type):
 
 
 def infer_constructor_params(
-    cls: Type[T], constructor: Union[Callable[..., T], Callable[[T], None]] = None
+    cls: Type[T], constructor: Optional[Union[Callable[..., T], Callable[[T], None]]] = None
 ) -> Dict[str, inspect.Parameter]:
     if constructor is None:
         constructor = cls.__init__
@@ -130,7 +130,13 @@ def infer_method_params(
 
     has_kwargs = False
     var_positional_key = None
-    for param_name in parameters.keys():
+    for param_name in list(parameters.keys()):
+        # Ignore special private parameters.
+        # This is necessary to make `FromParams` work with Pydantic, for example.
+        if param_name.startswith("__"):
+            del parameters[param_name]
+            continue
+
         param = parameters[param_name]
         if param.kind == param.VAR_KEYWORD:
             has_kwargs = True
@@ -339,7 +345,11 @@ def pop_and_construct_arg(
                 "get unexpected behavior."
             )
 
-    popped_params = params.pop(name, default) if default != _NO_DEFAULT else params.pop(name)
+    try:
+        popped_params = params.pop(name, default) if default != _NO_DEFAULT else params.pop(name)
+    except ConfigurationError:
+        raise ConfigurationError(f'Missing key "{name}" for {class_name}')
+
     if popped_params is None:
         return None
 
@@ -381,17 +391,21 @@ def construct_arg(
     if popped_params is default:
         return popped_params
 
-    from tango.step import Step, WithUnresolvedSteps
+    from tango.step import FunctionalStep, Step, StepIndexer, WithUnresolvedSteps
 
     origin = getattr(annotation, "__origin__", None)
     args = getattr(annotation, "__args__", [])
 
     # Try to guess if `popped_params` might be a step, come from a step, or contain a step.
-    could_be_step = try_from_step and (
-        origin == Step
-        or isinstance(popped_params, Step)
-        or _params_contain_step(popped_params)
-        or (isinstance(popped_params, (dict, Params)) and popped_params.get("type") == "ref")
+    could_be_step = (
+        try_from_step
+        and (
+            origin == Step
+            or isinstance(popped_params, Step)
+            or _params_contain_step(popped_params)
+            or (isinstance(popped_params, (dict, Params)) and popped_params.get("type") == "ref")
+        )
+        and not (class_name == "StepInfo" and argument_name == "config")
     )
     if could_be_step:
         # If we think it might be a step, we try parsing as a step _first_.
@@ -446,8 +460,11 @@ def construct_arg(
                     result = annotation.from_params(popped_params)
 
             if isinstance(result, Step):
-                expected_return_type = args[0]
-                return_type = inspect.signature(result.run).return_annotation
+                expected_return_type = args[0] if args else None
+                if isinstance(result, FunctionalStep):
+                    return_type = inspect.signature(result.WRAPPED_FUNC).return_annotation
+                else:
+                    return_type = inspect.signature(result.run).return_annotation
                 if return_type == inspect.Signature.empty:
                     logger.warning(
                         "Step %s has no return type annotation. Those are really helpful when "
@@ -456,7 +473,9 @@ def construct_arg(
                     )
                 else:
                     try:
-                        if not issubclass(return_type, expected_return_type):
+                        if expected_return_type is not None and not issubclass(
+                            return_type, expected_return_type
+                        ):
                             raise ConfigurationError(
                                 f"Step {result.name} returns {return_type}, but "
                                 f"we expected {expected_return_type}."
@@ -471,6 +490,18 @@ def construct_arg(
         else:
             return default
 
+    # For StepIndexer, we just return as-is and hope the for the best.
+    # At worst, user will get an error at runtime if they are trying to index a step
+    # result that can't be indexed.
+    # TODO (epwalsh): we could check the return type of the wrapped step here
+    # and make sure that:
+    #  1. It's an index-able object,
+    #  2. The item in the index-able object matches `annotation`.
+    #
+    # But that's complex and might have false negatives.
+    elif type(popped_params) == StepIndexer:
+        return popped_params
+
     # If the parameter type is a Python primitive, just pop it off
     # using the correct casting pop_xyz operation.
     elif annotation in {int, bool}:
@@ -483,7 +514,7 @@ def construct_arg(
             )
     elif annotation == str:
         # Strings are special because we allow casting from Path to str.
-        if type(popped_params) == str or isinstance(popped_params, Path):
+        if isinstance(popped_params, str) or isinstance(popped_params, Path):
             return str(popped_params)  # type: ignore
         else:
             raise TypeError(
@@ -530,7 +561,14 @@ def construct_arg(
     elif origin in (Tuple, tuple):
         value_list = []
 
-        for i, (value_cls, value_params) in enumerate(zip(annotation.__args__, popped_params)):
+        value_types = list(annotation.__args__)
+        if value_types[-1] == Ellipsis:
+            # Variable length tuples, e.g. 'Tuple[int, ...]', we set value_types to '[int] * len(popped_params)'.
+            value_types = value_types[:-1] + [value_types[-2]] * (
+                len(popped_params) - len(annotation.__args__) + 1
+            )
+
+        for i, (value_cls, value_params) in enumerate(zip(value_types, popped_params)):
             value = construct_arg(
                 str(value_cls),
                 argument_name + f".{i}",
@@ -636,7 +674,7 @@ def construct_arg(
         return popped_params
 
 
-class FromParams(CustomDetHash):
+class FromParams(DetHashWithVersion):
     """
     Mixin to give a :meth:`from_params` method to classes. We create a distinct base class for this
     because sometimes we want non :class:`~tango.common.Registrable`
@@ -647,8 +685,8 @@ class FromParams(CustomDetHash):
     def from_params(
         cls: Type[T],
         params_: Union[Params, dict, str],
-        constructor_to_call: Callable[..., T] = None,
-        constructor_to_inspect: Union[Callable[..., T], Callable[[T], None]] = None,
+        constructor_to_call: Optional[Callable[..., T]] = None,
+        constructor_to_inspect: Optional[Union[Callable[..., T], Callable[[T], None]]] = None,
         **extras,
     ) -> T:
         """
@@ -833,10 +871,3 @@ class FromParams(CustomDetHash):
             raise NotImplementedError(
                 f"{self.__class__.__name__}._to_params() needs to be implemented"
             )
-
-    def det_hash_object(self) -> Any:
-        r = (self.__class__.__qualname__, self.to_params())
-        if hasattr(self, "VERSION"):
-            return r + (getattr(self, "VERSION"),)
-        else:
-            return r

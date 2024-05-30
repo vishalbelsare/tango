@@ -8,11 +8,9 @@ from typing import List, Tuple
 import click
 import pytest
 
-from tango.common import Params
 from tango.common.testing import TangoTestCase
 from tango.settings import TangoGlobalSettings
 from tango.version import VERSION
-from tango.workspace import StepExecutionMetadata
 
 
 class TestRun(TangoTestCase):
@@ -28,11 +26,11 @@ class TestRun(TangoTestCase):
             parts = re.split(r"(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+", line)
             if len(parts) >= 3:
                 line = "".join(parts[2:])
+                line = re.sub(r"\s+[^ ]+$", "", line)
             elif len(parts) == 1:
                 line = parts[0]
             else:
                 raise ValueError(str(parts))
-            line = re.sub(r"\s+[^ ]+$", "", line)
             if line:
                 out.append(line.strip())
         return out
@@ -53,7 +51,7 @@ class TestRun(TangoTestCase):
         cleaned_log_lines = self.clean_log_lines(log_lines)
 
         for line in cleaned_stdout_lines[
-            next(i for i, line in enumerate(stdout_lines) if "Server started at" in line) :
+            next(i for i, line in enumerate(stdout_lines) if "Starting new run" in line) :
         ]:
             assert line in cleaned_log_lines
 
@@ -73,8 +71,6 @@ class TestRun(TangoTestCase):
             log_level,
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "noisy.jsonnet"),
-            "-i",
-            "test_fixtures.package",
             "-w",
             str(self.TEST_DIR),
             "-o",
@@ -89,32 +85,29 @@ class TestRun(TangoTestCase):
         _, cleaned_log_lines = self.check_logs(run_dir, result)
 
         # Debug messages.
-        assert cleaned_log_lines.count("[step noisy_step] debug message from cli_logger") == 1
-        assert cleaned_log_lines.count("[step noisy_step] debug message") == (
-            1 if log_level == "debug" else 0
-        )
+        assert cleaned_log_lines.count("debug message from cli_logger") == 1
+        assert cleaned_log_lines.count("debug message") == (1 if log_level == "debug" else 0)
 
         # Info messages.
-        assert cleaned_log_lines.count("[step noisy_step] info message from cli_logger") == 1
-        assert cleaned_log_lines.count("[step noisy_step] info message") == (
+        assert cleaned_log_lines.count("info message from cli_logger") == 1
+        assert cleaned_log_lines.count("info message") == (
             1 if log_level in {"debug", "info"} else 0
         )
 
         # Warning messages.
-        assert cleaned_log_lines.count("[step noisy_step] warning message from cli_logger") == 1
-        assert cleaned_log_lines.count("[step noisy_step] warning message") == (
+        assert cleaned_log_lines.count("warning message from cli_logger") == 1
+        assert cleaned_log_lines.count("warning message") == (
             1 if log_level in {"debug", "info", "warning"} else 0
         )
 
         # Error messages.
-        assert cleaned_log_lines.count("[step noisy_step] error message from cli_logger") == 1
-        assert cleaned_log_lines.count("[step noisy_step] error message") == (
+        assert cleaned_log_lines.count("error message from cli_logger") == 1
+        assert cleaned_log_lines.count("error message") == (
             1 if log_level in {"debug", "info", "warning", "error"} else 0
         )
 
         # Traceback.
         if raise_error:
-            assert "[step noisy_step] Uncaught exception" in cleaned_log_lines
             assert "Traceback (most recent call last):" in cleaned_log_lines
             assert "ValueError: Oh no!" in cleaned_log_lines
 
@@ -123,8 +116,6 @@ class TestRun(TangoTestCase):
             "tango",
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "hello_world.jsonnet"),
-            "-i",
-            "test_fixtures.package",
             "-w",
             str(self.TEST_DIR),
         ]
@@ -134,27 +125,7 @@ class TestRun(TangoTestCase):
         run_dir = next((self.TEST_DIR / "runs").iterdir())
         assert (run_dir / "hello").is_dir()
         assert (run_dir / "hello" / "cache-metadata.json").is_file()
-        assert (run_dir / "hello" / "execution-metadata.json").is_file()
         assert (run_dir / "hello_world").is_dir()
-
-        # Check metadata.
-        metadata_path = run_dir / "hello_world" / "execution-metadata.json"
-        assert metadata_path.is_file()
-        metadata_params = Params.from_file(metadata_path)
-        metadata = StepExecutionMetadata.from_params(metadata_params)
-        assert metadata.config == {
-            "type": "concat_strings",
-            "step_unique_id_override": "ConcatStringsStep-3qLNS3gLUQXBGN7rC8yzuYJnjTVp7kgu",
-            "string1": {"type": "ref", "ref": "StringStep-4cHbmoHigd3rvNn3w7shc1d45WA1ijSp"},
-            "string2": "World!",
-            "join_with": ", ",
-        }
-        if (Path.cwd() / ".git").exists():
-            assert metadata.git.commit is not None
-            assert metadata.git.remote is not None
-
-        # Check for requirements.txt file.
-        assert (run_dir / "hello_world" / "requirements.txt").is_file()
 
         # Check logs.
         self.check_logs(run_dir, result)
@@ -171,8 +142,6 @@ class TestRun(TangoTestCase):
             "tango",
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "hello_world.jsonnet"),
-            "-i",
-            "test_fixtures.package",
             "-w",
             "memory://",
         ]
@@ -184,8 +153,6 @@ class TestRun(TangoTestCase):
             "tango",
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "hello_world.jsonnet"),
-            "-i",
-            "test_fixtures.package",
         ]
         result = subprocess.run(cmd, capture_output=True)
         assert result.returncode == 0
@@ -195,8 +162,6 @@ class TestRun(TangoTestCase):
             "tango",
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "random.jsonnet"),
-            "-i",
-            "test_fixtures.package",
             "-w",
             str(self.TEST_DIR),
         ]
@@ -209,8 +174,6 @@ class TestRun(TangoTestCase):
             "tango",
             "run",
             str(self.FIXTURES_ROOT / "experiment" / "hello_world.jsonnet"),
-            "-i",
-            "test_fixtures.package",
             "-w",
             str(self.TEST_DIR),
             "--name",
@@ -240,8 +203,6 @@ class TestRun(TangoTestCase):
             + [
                 "run",
                 str(self.FIXTURES_ROOT / "experiment" / "logging_check.jsonnet"),
-                "-i",
-                "test_fixtures.package",
                 "-w",
                 str(self.TEST_DIR),
                 "-j",

@@ -40,14 +40,13 @@ class TestExperiment(TangoTestCase):
         with pytest.raises(CliRunError):
             self.run(
                 self.config,
-                include_package=["test_fixtures.package.steps"],
                 multicore=True,
                 parallelism=2,
             )
         latest_outputs = self.TEST_DIR / "workspace" / "latest"
         num_executed = 0
         for out in latest_outputs.iterdir():
-            if (out / "execution-metadata.json").exists():
+            if (out / "cache-metadata.json").exists():
                 num_executed += 1
         assert num_executed == 1
 
@@ -56,7 +55,6 @@ class TestExperiment(TangoTestCase):
 
         self.run(
             self.config,
-            include_package=["test_fixtures.package.steps"],
             multicore=True,
             parallelism=2,
             overrides=json.dumps({"steps.step1.fail": False}),
@@ -64,6 +62,6 @@ class TestExperiment(TangoTestCase):
         latest_outputs = self.TEST_DIR / "workspace" / "latest"
         num_executed = 0
         for out in latest_outputs.iterdir():
-            if (out / "execution-metadata.json").exists():
+            if (out / "cache-metadata.json").exists():
                 num_executed += 1
         assert num_executed == 3

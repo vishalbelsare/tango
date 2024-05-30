@@ -3,12 +3,13 @@ from typing import Any, Dict, Mapping, MutableMapping
 
 import pytest
 
-import test_fixtures.package.steps  # noqa: F401
 from tango import StepGraph
 from tango.common import Params, Registrable
+from tango.common.exceptions import ConfigurationError
 from tango.common.from_params import FromParams
 from tango.common.testing import TangoTestCase
-from tango.step import Step
+from tango.step import FunctionalStep, Step, step
+from tango.workspaces import MemoryWorkspace
 
 
 class TestStep(TangoTestCase):
@@ -26,7 +27,7 @@ class TestStep(TangoTestCase):
             def __init__(self, x: int):
                 self.x = x
 
-        @Step.register("foo")
+        @Step.register("foo", exist_ok=True)
         class FooStep(Step):
             def run(self, bar: Bar) -> Bar:  # type: ignore
                 return bar
@@ -45,6 +46,23 @@ class TestStep(TangoTestCase):
         step1 = SkipArgStep(arg="foo")
         step2 = SkipArgStep(arg="bar")
         assert step1.unique_id == step2.unique_id
+
+    def test_skip_default_arguments(self):
+        class SkipArgStep(Step):
+            def run(self) -> int:  # type: ignore
+                return 5
+
+        old_hash = SkipArgStep().unique_id
+
+        class SkipArgStep(Step):
+            SKIP_DEFAULT_ARGUMENTS = {"arg": 5}
+
+            def run(self, arg: int = 5) -> int:  # type: ignore
+                return arg
+
+        assert SkipArgStep().unique_id == old_hash
+        assert SkipArgStep(arg=5).unique_id == old_hash
+        assert SkipArgStep(arg=6).unique_id != old_hash
 
     def test_massage_kwargs(self):
         class CountLettersStep(Step):
@@ -135,3 +153,48 @@ class TestStep(TangoTestCase):
         }
         sg = StepGraph.from_params(config)
         assert len(sg["holder_consumer"].dependencies) > 0
+
+    def test_functional_step(self):
+        class Bar(FromParams):
+            def __init__(self, x: int):
+                self.x = x
+
+        @step(exist_ok=True)
+        def foo(bar: Bar) -> int:
+            return bar.x
+
+        assert issubclass(foo, FunctionalStep)
+        assert foo().run(Bar(x=1)) == 1
+
+        foo_step = Step.from_params({"type": "foo", "bar": {"x": 1}})
+        assert isinstance(foo_step, FunctionalStep)
+        assert isinstance(foo_step.kwargs["bar"], Bar)
+
+    def test_bound_functional_step(self):
+        class Bar(FromParams):
+            def __init__(self, x: int):
+                self.x = x
+
+        @step(exist_ok=True, bind=True)
+        def foo(self, bar: Bar) -> int:
+            assert self.work_dir.is_dir()
+            return bar.x
+
+        foo_step = Step.from_params({"type": "foo", "bar": {"x": 1}})
+        assert isinstance(foo_step, FunctionalStep)
+        assert foo_step.result(MemoryWorkspace()) == 1
+
+    def test_bound_functional_step_missing_self(self):
+        @step(exist_ok=True, bind=True)
+        def foo(x: int) -> int:
+            return x
+
+        with pytest.raises(ConfigurationError):
+            Step.from_params({"type": "foo", "x": 1})
+
+        @step(exist_ok=True, bind=True)
+        def bar(s, x: int) -> int:
+            return x
+
+        with pytest.raises(ConfigurationError):
+            Step.from_params({"type": "bar", "x": 1})

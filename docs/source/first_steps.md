@@ -120,6 +120,28 @@ and warn you when the types don't match up.
 So as long as Tango is able to import this module (`components.py`) these step implementations will be added to the registry
 and Tango will know how to instantiate and run them.
 
+There's also a short-hand way of implementing steps, using the {func}`@step() <tango.step.step>` function decorator:
+
+```python
+from tango import step
+
+@step(deterministic=False)
+def random_choice(choices: List[str]) -> str:
+    return random.choice(choices)
+
+@step()
+def concat_strings(string1: str, string2: str) -> str:
+    return string1 + string2
+```
+
+This will register these steps under the name of the corresponding function, i.e. "random_choice" and "concat_strings", by default, though that can be overridden by specifying the "name" parameter to the decorator:
+
+```python
+@step(name="random-string", deterministic=False)
+def random_choice(choices: List[str]) -> str:
+    return random.choice(choices)
+```
+
 ## Executing an experiment
 
 At this point we've implemented our custom steps (`components.py`) and created our configuration
@@ -225,7 +247,7 @@ Computing...: 100%|##########| 100/100 [00:05<00:00, 18.99it/s]
 ✓ The output for "add_numbers" is in workspace/runs/live-tarpon/add_numbers
 ```
 
-The last line in the output tells us where we can find the result of our "add_numbers" step. `live-parpon` is
+The last line in the output tells us where we can find the result of our "add_numbers" step. `live-tarpon` is
 the name of the run. Run names are randomly generated and may be different on your machine. `add_numbers` is the
 name of the step in your config. The whole path is a symlink to a directory, which contains (among other things)
 a file `data.json`:
@@ -364,16 +386,48 @@ class FooStep(Step):
 
 ### `Registrable`
 
-The {class}`~tango.common.registrable.Registrable` class is special kind of {class}`~tango.common.from_params.FromParams` class that allows you to deserialize
-any subclass of the expected class from a config.
+The {class}`~tango.common.registrable.Registrable` class is a special kind of {class}`~tango.common.from_params.FromParams` class that allows you to specify from the config which subclass of an expected class to deserialize into.
 
-We've already come across this, actually, because {class}`~tango.step.Step` inherits from `Registrable`, which is why Tango is able to instantiate specific `Step` subclasses from a config.
+This is actually how we've been instantiating specific `Step` subclasses. Because {class}`~tango.step.Step` inherits from {class}`~tango.common.registrable.Registrable`, we can use the `"type"` fields in the config file to specify a `Step` subclass.
 
-This is very useful when you're writing a step that requires a certain type as input, but you want to be able to change the exact subclass of the type from your configuration file.
-For example, the {class}`~tango.integrations.torch.TorchTrainStep` step takes several `Registrable` base classes as input such as {class}`~tango.integrations.torch.Model` and
-{class}`~tango.integrations.torch.Optimizer`, so that the user can decide which exact `Model` and `Optimizer` implementation to use.
+This is also very useful when you're writing a step that requires a certain type as input, but you want to be able to change the exact subclass of the type from your config file. For example, the {class}`~tango.integrations.torch.TorchTrainStep` takes `Registrable` inputs such as {class}`~tango.integrations.torch.Model`. Model variants can then be subclasses that are specified in the config file by their registered names. A sketch of this might look like the following: 
 
-In order to specify which subclass to deserialize to, you just need to add the `"type": "..."` field to the corresponding section of the JSON/Jsonnet/YAML config.
-The value for "type" can either be the name that the class is registered under (e.g. "torch::train" for `TorchTrainStep`), or the fully qualified class name (e.g. `tango.integrations.torch.TorchTrainStep`).
+```python
+from tango import Step
+from tango.common import FromParams, Registrable
+
+class Model(torch.nn.Module, Registrable):
+    ...
+
+@Model.register("variant1")
+class Variant1(Model):
+    ...
+
+@Model.register("variant2")
+class Variant2(Model):
+    ...
+
+@Step.register("torch::train")
+class TorchTrainerStep(Step):
+    def run(self, model: Model, ...) -> Model:
+        ...
+```
+
+And a sketch of the config file would be something like this:
+
+```json
+{
+  "steps": {
+    "train": {
+      "type": "torch::train",
+      "model": {
+        "type": "variant1",
+      }
+    }
+  }
+}
+```
+
+As in the `FromParams` example the specifications can be nested, but now we also denote the subclass with the `"type": "..."` field. To swap models we need only change "variant1" to "variant2" in the config. The value for "type" can either be the name that the class is registered under (e.g. "train" for `TorchTrainStep`), or the fully qualified class name (e.g. `tango.integrations.torch.TorchTrainStep`).
 
 You'll see more examples of this in the [next section](examples/index).

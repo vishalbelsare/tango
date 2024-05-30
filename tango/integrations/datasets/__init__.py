@@ -23,7 +23,6 @@ You could run this with:
 """
 
 
-import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypeVar, Union, overload
@@ -56,7 +55,7 @@ def convert_to_tango_dataset_dict(hf_dataset_dict: ds.DatasetDict) -> DatasetDic
 
 
 @overload
-def convert_to_tango_dataset_dict(hf_dataset_dict: ds.IterableDatasetDict) -> IterableDatasetDict:
+def convert_to_tango_dataset_dict(hf_dataset_dict: ds.IterableDatasetDict) -> IterableDatasetDict:  # type: ignore
     ...
 
 
@@ -87,7 +86,7 @@ class DatasetsFormat(Format[T]):
     It is the default :class:`~tango.format.Format` for the :class:`LoadDataset` step.
     """
 
-    VERSION = 1
+    VERSION = "001"
 
     def write(self, artifact: T, dir: PathOrStr):
         dataset_path = Path(dir) / "data"

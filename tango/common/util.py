@@ -4,14 +4,15 @@ import signal
 import string
 import sys
 import traceback
-from contextlib import contextmanager
+from collections import OrderedDict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, tzinfo
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import pytz
 
-from .aliases import PathOrStr
 from .exceptions import SigTermReceived
 
 
@@ -31,25 +32,6 @@ def _handle_sigterm(sig, frame):
 
 def install_sigterm_handler():
     signal.signal(signal.SIGTERM, _handle_sigterm)
-
-
-@contextmanager
-def push_python_path(path: PathOrStr):
-    """
-    Prepends the given path to `sys.path`.
-
-    This method is intended to use with `with`, so after its usage, its value willbe removed from
-    `sys.path`.
-    """
-    # In some environments, such as TC, it fails when sys.path contains a relative path, such as ".".
-    path = Path(path).resolve()
-    path = str(path)
-    sys.path.insert(0, path)
-    try:
-        yield
-    finally:
-        # Better to remove by value, in case `sys.path` was manipulated in between.
-        sys.path.remove(path)
 
 
 _extra_imported_modules: Set[str] = set()
@@ -94,7 +76,9 @@ def resolve_module_name(package_name: str) -> Tuple[str, Path]:
     return package_name, base_path
 
 
-def import_module_and_submodules(package_name: str, exclude: Optional[Set[str]] = None) -> None:
+def import_module_and_submodules(
+    package_name: str, exclude: Optional[Set[str]] = None, recursive: bool = True
+) -> None:
     """
     Import all submodules under the given package.
 
@@ -106,21 +90,46 @@ def import_module_and_submodules(package_name: str, exclude: Optional[Set[str]] 
         package_name, base_path = resolve_module_name(package_name)
     else:
         base_path = Path(".")
+    base_path = base_path.resolve()
 
     if exclude and package_name in exclude:
         return
 
     importlib.invalidate_caches()
 
-    # For some reason, python doesn't always add this by default to your path, but you pretty much
-    # always want it when using `--include-package`.  And if it's already there, adding it again at
-    # the end won't hurt anything.
-    with push_python_path(base_path):
-        # Import at top level
-        module = importlib.import_module(package_name)
-        path = getattr(module, "__path__", [])
-        path_string = "" if not path else path[0]
+    # Ensure `base_path` is first in `sys.path`.
+    if str(base_path) not in sys.path:
+        sys.path.insert(0, str(base_path))
+    else:
+        sys.path.insert(0, sys.path.pop(sys.path.index(str(base_path))))
 
+    # Certain packages might mess with sys.excepthook which we don't like since
+    # we mess with sys.excepthook ourselves. If it looks like the package is overriding
+    # the hook for a reason, we'll leave it be but also make sure our hook is still called.
+    excepthook = sys.excepthook
+
+    # Import at top level
+    try:
+        module = importlib.import_module(package_name)
+    finally:
+        if sys.excepthook != excepthook:
+            if sys.excepthook.__module__.startswith("rich"):
+                # We definitely don't want rich's traceback hook because that will mess
+                # with our exception handling.
+                sys.excepthook = excepthook
+            else:
+                new_hook = sys.excepthook
+
+                def excepthook_wrapper(exctype, value, traceback):
+                    excepthook(exctype, value, traceback)
+                    new_hook(exctype, value, traceback)
+
+                sys.excepthook = excepthook_wrapper
+
+    path = getattr(module, "__path__", [])
+    path_string = "" if not path else path[0]
+
+    if recursive:
         # walk_packages only finds immediate children, so need to recurse.
         for module_finder, name, _ in pkgutil.walk_packages(path):
             # Sometimes when you import third-party libraries that are on your path,
@@ -199,6 +208,17 @@ def filename_is_safe(filename: str) -> bool:
     return all(c in SAFE_FILENAME_CHARS for c in filename)
 
 
+def make_safe_filename(name: str) -> str:
+    if filename_is_safe(name):
+        return name
+    else:
+        from tango.common.det_hash import det_hash
+
+        name_hash = det_hash(name)
+        name = name.replace(" ", "-").replace("/", "--")
+        return "".join(c for c in name if c in SAFE_FILENAME_CHARS) + f"-{name_hash[:7]}"
+
+
 def could_be_class_name(name: str) -> bool:
     if "." in name and not name.endswith("."):
         return all([_is_valid_python_name(part) for part in name.split(".")])
@@ -249,7 +269,7 @@ def exception_to_string(e: BaseException) -> str:
     """
     Generates a string that contains an exception plus stack frames based on an exception.
 
-    This became trivial in Python 3.10, but we need to run on Pytohn 3.7 as well.
+    This became trivial in Python 3.10, but we need to run on Python 3.8 as well.
     """
     if sys.version_info >= (3, 10):
         formatted = traceback.format_exception(e)
@@ -264,3 +284,44 @@ def utc_now_datetime() -> datetime:
 
 def local_timezone() -> Optional[tzinfo]:
     return datetime.now().astimezone().tzinfo
+
+
+def replace_steps_with_unique_id(o: Any):
+    from tango.step import Step, StepIndexer
+
+    if isinstance(o, Step):
+        return {"type": "ref", "ref": o.unique_id}
+    elif isinstance(o, StepIndexer):
+        return {"type": "ref", "ref": o.step.unique_id, "key": o.key}
+    elif isinstance(o, (list, tuple, set)):
+        return o.__class__(replace_steps_with_unique_id(i) for i in o)
+    elif isinstance(o, dict):
+        return {key: replace_steps_with_unique_id(value) for key, value in o.items()}
+    else:
+        return o
+
+
+def jsonify(o: Any) -> Any:
+    """
+    Transform an object into a JSON-serializable equivalent (if there is one)
+    in a deterministic way. For example, tuples and sets are turned into lists,
+    dictionaries are turned into ordered dictionaries where the order depends on the sorting
+    of the keys, and datetimes are turned into formatted strings.
+    """
+    if isinstance(o, (tuple, set)):
+        return [jsonify(x) for x in o]
+    elif isinstance(o, dict):
+        return OrderedDict((k, jsonify(v)) for k, v in sorted(o.items(), key=lambda x: x[0]))
+    elif isinstance(o, datetime):
+        return o.strftime("%Y-%m-%dT%H:%M:%S")
+    elif is_dataclass(o):
+        return jsonify(asdict(o))
+    elif isinstance(o, Path):
+        return str(o)
+    else:
+        return o
+
+
+class StrEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.value

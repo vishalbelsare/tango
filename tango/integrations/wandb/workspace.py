@@ -8,6 +8,7 @@ from urllib.parse import ParseResult
 import pytz
 import wandb
 
+from tango.common.exceptions import StepStateError
 from tango.common.file_lock import FileLock
 from tango.common.util import exception_to_string, tango_cache_dir, utc_now_datetime
 from tango.step import Step
@@ -16,7 +17,7 @@ from tango.step_info import StepInfo, StepState
 from tango.workspace import Run, Workspace
 
 from .step_cache import WandbStepCache
-from .util import ArtifactKind, RunKind, check_environment
+from .util import RunKind, check_environment
 
 T = TypeVar("T")
 
@@ -40,6 +41,27 @@ class WandbWorkspace(Workspace):
 
     .. tip::
         Registered as a :class:`~tango.workspace.Workspace` under the name "wandb".
+
+    .. tip::
+        If you want to change the artifact kind for step result artifacts uploaded
+        to W&B, add a field called ``artifact_kind`` to the ``metadata`` of
+        the :class:`~tango.step.Step` class.
+
+        This can be useful if you want model objects to be added to the model zoo.
+        In that you would set ``artifact_kind = "model"``.
+        For example, your config for the step would look like this:
+
+        .. code-block::
+
+            { type: "trainer", step_metadata: { artifact_kind: "model" }, ... }
+
+        Or just add this to the ``METADATA`` class attribute:
+
+        .. code-block::
+
+            @Step.register("trainer")
+            class TrainerStep(Step):
+                METADATA = {"artifact_kind": "model"}
     """
 
     def __init__(self, project: str, entity: Optional[str] = None):
@@ -143,10 +165,11 @@ class WandbWorkspace(Workspace):
 
         step_info = self._get_updated_step_info(step.unique_id) or StepInfo.new_from_step(step)
         if step_info.state not in {StepState.INCOMPLETE, StepState.FAILED, StepState.UNCACHEABLE}:
-            raise RuntimeError(
-                f"Step '{step.name}' is trying to start, but it is already {step_info.state}. "
-                "If you are certain the step is not running somewhere else, delete the lock "
-                f"file at {lock_path}."
+            raise StepStateError(
+                step,
+                step_info.state,
+                context="If you are certain the step is not running somewhere else, delete the lock "
+                f"file at {lock_path}.",
             )
 
         try:
@@ -208,7 +231,11 @@ class WandbWorkspace(Workspace):
                 f"Did you forget to call {self.__class__.__name__}.step_starting() first?"
             )
 
-        step_info = self._running_step_info.pop(step.unique_id)
+        step_info = self._running_step_info.get(step.unique_id) or self._get_updated_step_info(
+            step.unique_id
+        )
+        if step_info is None:
+            raise KeyError(step.unique_id)
 
         try:
             if step.cache_results:
@@ -218,13 +245,7 @@ class WandbWorkspace(Workspace):
                     # Caching the iterator will consume it, so we write it to the
                     # cache and then read from the cache for the return value.
                     result = self.step_cache[step]
-                result_artifact = self.cache.get_step_result_artifact(step)
-                if result_artifact is None:
-                    raise RuntimeError(f"Failed to find step result artifact for {step.unique_id}")
-                step_info.result_location = (
-                    f"{self.wandb_project_url}/artifacts/{ArtifactKind.STEP_RESULT.value}"
-                    f"/{result_artifact._sequence_name}/{result_artifact.commit_hash}"
-                )
+                step_info.result_location = self.cache.get_step_result_artifact_url(step)
             else:
                 # Create an empty artifact in order to build the DAG in W&B.
                 self.cache.create_step_result_artifact(step)
@@ -237,6 +258,8 @@ class WandbWorkspace(Workspace):
         finally:
             self.locks[step].release()
             del self.locks[step]
+            if step.unique_id in self._running_step_info:
+                del self._running_step_info[step.unique_id]
 
         return result
 
@@ -247,12 +270,16 @@ class WandbWorkspace(Workspace):
                 f"Did you forget to call {self.__class__.__name__}.step_starting() first?"
             )
 
-        step_info = self._running_step_info.pop(step.unique_id)
+        step_info = self._running_step_info.get(step.unique_id) or self._get_updated_step_info(
+            step.unique_id
+        )
+        if step_info is None:
+            raise KeyError(step.unique_id)
 
         try:
             # Update StepInfo, marking the step as failed.
             if step_info.state != StepState.RUNNING:
-                raise RuntimeError(f"Step '{step.name}' is failing, but it never started.")
+                raise StepStateError(step, step_info.state)
             step_info.end_time = utc_now_datetime()
             step_info.error = exception_to_string(e)
             wandb.run.config.update({"step_info": step_info.to_json_dict()}, allow_val_change=True)
@@ -262,6 +289,15 @@ class WandbWorkspace(Workspace):
         finally:
             self.locks[step].release()
             del self.locks[step]
+            if step.unique_id in self._running_step_info:
+                del self._running_step_info[step.unique_id]
+
+    def remove_step(self, step_unique_id: str):
+        """
+        Removes cached step using the given unique step id
+        :raises KeyError: If there is no step with the given name.
+        """
+        raise NotImplementedError()
 
     def register_run(self, targets: Iterable[Step], name: Optional[str] = None) -> Run:
         all_steps = set(targets)
@@ -330,7 +366,7 @@ class WandbWorkspace(Workspace):
         matching_runs = list(
             self.wandb_client.runs(
                 f"{self.entity}/{self.project}",
-                filters={"config.job_type": RunKind.TANGO_RUN.value},
+                filters={"config.job_type": RunKind.TANGO_RUN.value},  # type: ignore
             )
         )
         for wandb_run in matching_runs:
@@ -341,7 +377,7 @@ class WandbWorkspace(Workspace):
         matching_runs = list(
             self.wandb_client.runs(
                 f"{self.entity}/{self.project}",
-                filters={"display_name": name, "config.job_type": RunKind.TANGO_RUN.value},
+                filters={"display_name": name, "config.job_type": RunKind.TANGO_RUN.value},  # type: ignore
             )
         )
         if not matching_runs:
@@ -385,7 +421,7 @@ class WandbWorkspace(Workspace):
             filters["display_name"] = step_name
         for wandb_run in self.wandb_client.runs(
             f"{self.entity}/{self.project}",
-            filters=filters,
+            filters=filters,  # type: ignore
         ):
             step_info = StepInfo.from_json_dict(wandb_run.config["step_info"])
             # Might need to fix the step info the step failed and we failed to update the config.
@@ -412,7 +448,7 @@ class WandbWorkspace(Workspace):
             filters[f"config.steps.{step_name}.unique_id"] = step_id
         for wandb_run in self.wandb_client.runs(
             f"{self.entity}/{self.project}",
-            filters=filters,
+            filters=filters,  # type: ignore
         ):
             if step_name is not None:
                 step_info_data = wandb_run.config["steps"][step_name]

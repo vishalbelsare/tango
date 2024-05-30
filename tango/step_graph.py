@@ -4,8 +4,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Set, Type, Union
 from tango.common import PathOrStr
 from tango.common.exceptions import ConfigurationError
 from tango.common.params import Params
-from tango.common.util import import_extra_module
-from tango.step import Step
+from tango.step import Step, StepIndexer
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +127,18 @@ class StepGraph(Mapping[str, Step]):
 
         return cls(step_dict)
 
-    def sub_graph(self, step_name: str) -> "StepGraph":
-        if step_name not in self.parsed_steps:
-            raise KeyError(
-                f"{step_name} is not a part of this StepGraph. "
-                f"Available steps are: {list(self.parsed_steps.keys())}"
+    def sub_graph(self, *step_names: str) -> "StepGraph":
+        step_dict: Dict[str, Step] = {}
+        for step_name in step_names:
+            if step_name not in self.parsed_steps:
+                raise KeyError(
+                    f"{step_name} is not a part of this StepGraph. "
+                    f"Available steps are: {list(self.parsed_steps.keys())}"
+                )
+            step_dict.update(
+                {dep.name: dep for dep in self.parsed_steps[step_name].recursive_dependencies}
             )
-        step_dict = {dep.name: dep for dep in self.parsed_steps[step_name].recursive_dependencies}
-        step_dict[step_name] = self.parsed_steps[step_name]
+            step_dict[step_name] = self.parsed_steps[step_name]
         return StepGraph(step_dict)
 
     @staticmethod
@@ -143,7 +146,7 @@ class StepGraph(Mapping[str, Step]):
         keys = set(d.keys())
         if keys == {"ref"}:
             return True
-        if keys == {"type", "ref"} and d["type"] == "ref":
+        if keys >= {"type", "ref"} and d["type"] == "ref":
             return True
         return False
 
@@ -169,12 +172,21 @@ class StepGraph(Mapping[str, Step]):
             return o.__class__(cls._replace_step_dependencies(i, existing_steps) for i in o)
         elif isinstance(o, (dict, Params)):
             if cls._dict_is_ref(o):
-                return existing_steps[o["ref"]]
+                if "key" in o:
+                    return StepIndexer(existing_steps[o["ref"]], o["key"])
+                else:
+                    return existing_steps[o["ref"]]
             else:
-                return {
+                result = {
                     key: cls._replace_step_dependencies(value, existing_steps)
                     for key, value in o.items()
                 }
+                if isinstance(o, dict):
+                    return result
+                elif isinstance(o, Params):
+                    return Params(result, history=o.history)
+                else:
+                    raise RuntimeError(f"Object {o} is of unexpected type {o.__class__}.")
         elif o is not None and not isinstance(o, (bool, str, int, float)):
             raise ValueError(o)
         return o
@@ -228,8 +240,6 @@ class StepGraph(Mapping[str, Step]):
     @classmethod
     def from_file(cls, filename: PathOrStr) -> "StepGraph":
         params = Params.from_file(filename)
-        for package_name in params.pop("include_package", []):
-            import_extra_module(package_name)
         return StepGraph.from_params(params.pop("steps", keep_as_dict=True))
 
     def to_config(self, include_unique_id: bool = False) -> Dict[str, Dict]:
@@ -242,6 +252,8 @@ class StepGraph(Mapping[str, Step]):
                 return {key: _to_config(value) for key, value in o.items()}
             elif isinstance(o, Step):
                 return {"type": "ref", "ref": o.name}
+            elif isinstance(o, StepIndexer):
+                return {"type": "ref", "ref": o.step.name, "key": o.key}
             elif o is not None and not isinstance(o, (bool, str, int, float)):
                 raise ValueError(o)
             return o
@@ -257,7 +269,7 @@ class StepGraph(Mapping[str, Step]):
                 step_dict[step_name] = {
                     key: _to_config(val) for key, val in step._to_params()["kwargs"].items()
                 }
-                step_dict[step_name]["type"] = step.__module__ + "." + step.__class__.__name__
+                step_dict[step_name]["type"] = step.__module__ + "." + step.class_name
 
                 # We only add cache_results and format to the config if the values are different from default.
                 if step.cache_results != step.CACHEABLE:

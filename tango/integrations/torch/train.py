@@ -1,8 +1,9 @@
 import logging
+import math
 import os
 import shutil
 from itertools import islice
-from typing import Any, Dict, List, Optional, Set, cast
+from typing import Any, Dict, List, Optional, Set, Union, cast
 
 import more_itertools
 import torch
@@ -16,7 +17,7 @@ from tango.common.lazy import Lazy
 from tango.common.tqdm import Tqdm
 from tango.common.util import get_extra_imported_modules, import_extra_module
 from tango.format import Format
-from tango.step import Step
+from tango.step import Step, StepResources
 from tango.workspace import Workspace
 
 from .data import DataLoader
@@ -71,10 +72,15 @@ class TorchTrainStep(Step):
     CACHEABLE = True
     FORMAT: Format = TorchFormat()
     SKIP_ID_ARGUMENTS = {"distributed_port", "log_every"}
+    METADATA = {"artifact_kind": "model"}
+
+    @property
+    def resources(self) -> StepResources:
+        return self.step_resources or StepResources(gpu_count=self.kwargs["device_count"])
 
     def run(  # type: ignore[override]
         self,
-        model: Lazy[Model],
+        model: Union[Lazy[Model], Model],  # Lazy has to come first
         training_engine: Lazy[TrainingEngine],
         dataset_dict: DatasetDictBase,
         train_dataloader: Lazy[DataLoader],
@@ -222,7 +228,7 @@ class TorchTrainStep(Step):
 
     def _train(
         self,
-        model: Lazy[Model],
+        model: Union[Model, Lazy[Model]],
         training_engine: Lazy[TrainingEngine],
         dataset_dict: DatasetDictBase,
         train_dataloader: Lazy[DataLoader],
@@ -246,7 +252,6 @@ class TorchTrainStep(Step):
         callbacks: Optional[List[Lazy[TrainCallback]]] = None,
         remove_stale_checkpoints: bool = True,
     ) -> Model:
-
         is_distributed = False
         num_workers = 1
         if devices and len(devices) > 1:
@@ -263,6 +268,12 @@ class TorchTrainStep(Step):
             raise ConfigurationError(
                 "One of 'train_steps' or 'train_epochs' needs to be specified, but not both."
             )
+
+        if validate_every is not None and checkpoint_every is not None:
+            if checkpoint_every % validate_every != 0 and validate_every % checkpoint_every != 0:
+                raise ConfigurationError(
+                    "'checkpoint_every' needs to be multiple of 'validate_every' or vice versa"
+                )
 
         config = TrainConfig(
             self.unique_id,
@@ -308,7 +319,10 @@ class TorchTrainStep(Step):
                 nprocs=num_workers,
             )
             self.logger.info("Constructing final model")
-            final_model = model.construct()
+            if isinstance(model, Lazy):
+                final_model = model.construct()
+            else:
+                final_model = model
         else:
             final_model = _train(  # type: ignore[assignment]
                 0,
@@ -340,7 +354,7 @@ def _train(
     worker_id: int,
     workspace: Workspace,
     config: TrainConfig,
-    model: Lazy[Model],
+    model: Union[Model, Lazy[Model]],
     training_engine: Lazy[TrainingEngine],
     dataset_dict: DatasetDictBase,
     train_dataloader: Lazy[DataLoader],
@@ -348,6 +362,9 @@ def _train(
     callbacks: Optional[List[Lazy[TrainCallback]]] = None,
     include_package: Optional[Set[str]] = None,
 ) -> Optional[Model]:
+    # Set random seeds.
+    set_seed_all(config.seed)
+
     config.worker_id = worker_id
 
     if config.is_distributed and include_package:
@@ -395,7 +412,9 @@ def _train(
             steps_per_epoch = len(train_dataloader)
         except TypeError:
             raise ConfigurationError("You must set 'train_steps' for streaming/iterable datasets")
-        config.train_steps = steps_per_epoch * (config.train_epochs or 1)
+        config.train_steps = math.ceil(
+            steps_per_epoch * (config.train_epochs or 1) / config.grad_accum
+        )
 
     assert config.train_steps is not None  # for mypy
 
@@ -405,7 +424,7 @@ def _train(
                 config.validation_steps = len(validation_dataloader)
             except TypeError:
                 raise ConfigurationError(
-                    "You must sest 'validation_steps' for streaming/iterable datasets"
+                    "You must set 'validation_steps' for streaming/iterable datasets"
                 )
 
     # Make sure we're using a DistributedSampler during distributed training.
@@ -414,18 +433,27 @@ def _train(
         if validation_dataloader is not None:
             check_dataloader(validation_dataloader)
 
-    # Set random seeds.
-    set_seed_all(config.seed)
-
+    # The (training) loss for each batch, updated every training batch.
     batch_loss: float = 0.0
-    best_batch_loss: Optional[float] = None
+    # The value of the validation metric (could be loss), updated after every validation loop.
     val_metric: Optional[float] = None
+    # The best validation metric over all validation set passes.
     best_val_metric: Optional[float] = None
+    # The best validation metric over all validation set passes that correspond to a checkpoint.
+    # Could be different from `best_val_metric` if `checkpoint_every` > `validate_every`.
+    best_val_metric_checkpointed: Optional[float] = None
+    # The step to start training from.
     start_step: int = 0
+    # The current training step.
+    step: int = start_step
+    # If we should do a validation pass after the current training batch.
+    should_validate_this_step: bool = False
+
+    # Load state from checkpoint.
     if initial_state is not None:
         val_metric = initial_state[f"val_{config.val_metric_name}"]
         best_val_metric = initial_state[f"best_{config.val_metric_name}"]
-        best_batch_loss = initial_state["best_batch_loss"]
+        best_val_metric_checkpointed = initial_state[f"best_{config.val_metric_name}_checkpointed"]
         start_step = initial_state["training_steps"]
 
     # Initialize callbacks.
@@ -456,32 +484,45 @@ def _train(
 
     def is_best_checkpoint() -> bool:
         """
-        A closure that we'll call when saving checkpoints to check if we should hardlink
+        A closure that we'll call when saving checkpoints to check if we should link
         the best checkpoint path to the current checkpoint file.
         """
-        if val_metric is not None and best_val_metric is not None:
-            return (config.minimize_val_metric and val_metric <= best_val_metric) or (
-                not config.minimize_val_metric and val_metric >= best_val_metric
-            )
-        elif best_batch_loss is not None:
-            return best_batch_loss <= batch_loss
+        if val_metric is not None:
+            if best_val_metric_checkpointed is not None:
+                return (
+                    config.minimize_val_metric and val_metric <= best_val_metric_checkpointed
+                ) or (not config.minimize_val_metric and val_metric >= best_val_metric_checkpointed)
+            else:
+                return False
         else:
-            return False
+            # Without a validation loop we always treat the most recent checkpoint as the best.
+            return True
 
     def save_state(step: int):
         """
         A closure that we'll call every `checkpoint_every` steps in the train loop to
         save model and training state.
         """
+        # Update best loss/metric trackers.
+        nonlocal best_val_metric_checkpointed
+        if should_validate_this_step and val_metric is not None:
+            if (
+                best_val_metric_checkpointed is None
+                or (config.minimize_val_metric and val_metric <= best_val_metric_checkpointed)
+                or (not config.minimize_val_metric and val_metric >= best_val_metric_checkpointed)
+            ):
+                best_val_metric_checkpointed = val_metric
+
         train_state = {
             "training_steps": step + 1,
-            "best_batch_loss": best_batch_loss,
             f"val_{config.val_metric_name}": val_metric,
             f"best_{config.val_metric_name}": best_val_metric,
+            f"best_{config.val_metric_name}_checkpointed": best_val_metric_checkpointed,
             "callbacks": [
                 callback.state_dict() for callback in callbacks  # type: ignore[union-attr]
             ],
         }
+
         # For reason mypy can't figure out that `training_engine` is a `TrainingEngine` in this closure,
         # and not a `Lazy[TrainingEngine]`.
         cast(TrainingEngine, training_engine).save_checkpoint(
@@ -568,14 +609,21 @@ def _train(
             for callback in callbacks:
                 callback.pre_batch(step, current_epoch, batch)
             batch_loss = 0.0
+            batch_outputs = []
             for micro_batch_idx, micro_batch in enumerate(batch):
                 # Get loss.
-                micro_batch_loss = training_engine.forward_train(
+                micro_batch_loss, micro_batch_outputs = training_engine.forward_train(
                     micro_batch, micro_batch_idx, len(batch)
                 )
                 if torch.isnan(micro_batch_loss):
                     raise ValueError("nan loss encountered")
                 batch_loss += micro_batch_loss.detach().item()
+                batch_outputs.append(
+                    {
+                        key: output.detach() if isinstance(output, torch.Tensor) else output
+                        for key, output in micro_batch_outputs.items()
+                    }
+                )
 
                 # Calculate gradients.
                 training_engine.backward(micro_batch_loss)
@@ -583,13 +631,11 @@ def _train(
                 # Clean up in case it saves memory.
                 del micro_batch
                 del micro_batch_loss
+                del micro_batch_outputs
 
             # Post-batch callback.
             for callback in callbacks:
-                callback.post_batch(step, current_epoch, batch_loss)
-
-            if best_batch_loss is None or batch_loss <= best_batch_loss:
-                best_batch_loss = batch_loss
+                callback.post_batch(step, current_epoch, batch_loss, batch_outputs)
 
             del batch
 
@@ -598,22 +644,24 @@ def _train(
             # Find out whether we should validate
             if config.validation_split is None:
                 # If we can't validate, we don't.
-                should_validate = False
+                should_validate_this_step = False
             elif step == config.train_steps - 1:
                 # If we're at the end of the training run, we always validate.
-                should_validate = True
+                should_validate_this_step = True
             elif config.validate_every is not None and (step + 1) % config.validate_every == 0:
                 # If validate_every is given, we use that to decide.
-                should_validate = True
+                should_validate_this_step = True
             elif config.validate_every is None and epoch != train_batch_iterator.peek()[1][0]:
                 # If validate_every is not given, we validate at the end of the epoch.
-                should_validate = True
+                should_validate_this_step = True
             else:
                 # Otherwise, we don't validate.
-                should_validate = False
+                should_validate_this_step = False
 
             # Gather average loss across all workers.
-            if (config.should_log_this_step(step) or should_validate) and config.is_distributed:
+            if (
+                config.should_log_this_step(step) or should_validate_this_step
+            ) and config.is_distributed:
                 batch_loss_tensor = torch.tensor(batch_loss, device=device)
                 dist.all_reduce(batch_loss_tensor)
                 batch_loss = batch_loss_tensor.item() / config.world_size
@@ -621,7 +669,7 @@ def _train(
             if config.should_log_this_step(step):
                 # Callbacks.
                 for callback in callbacks:
-                    callback.log_batch(step, current_epoch, batch_loss)
+                    callback.log_batch(step, current_epoch, batch_loss, batch_outputs)
 
                 # Update progress bar.
                 metrics_to_log: Dict[str, float] = {"batch_loss": batch_loss}
@@ -633,7 +681,7 @@ def _train(
                     train_batch_iterator_tqdm.set_postfix(**metrics_to_log)
 
             # Validate.
-            if should_validate:
+            if should_validate_this_step:
                 assert validation_dataloader is not None
                 assert config.validation_steps is not None
 
@@ -691,16 +739,24 @@ def _train(
                 # Reset model to train mode.
                 training_engine.model.train()
 
-                if best_val_metric is None:
+                if (
+                    best_val_metric is None
+                    or (config.minimize_val_metric and val_metric <= best_val_metric)
+                    or (not config.minimize_val_metric and val_metric >= best_val_metric)
+                ):
                     best_val_metric = val_metric
-                elif config.minimize_val_metric and val_metric <= best_val_metric:
-                    best_val_metric = val_metric
-                elif not config.minimize_val_metric and val_metric >= best_val_metric:
-                    best_val_metric = val_metric
+
+                # Checkpoint.
+                if config.should_checkpoint_this_step(step):
+                    save_state(step)
 
                 # Post validation callback.
                 for callback in callbacks:
                     callback.post_val_loop(step, current_epoch, val_metric, best_val_metric)
+
+                # Reset model to train mode again in case the callbacks messed with it.
+                if callbacks:
+                    training_engine.model.train()
 
                 # Update progress bar again.
                 metrics_to_log = {
@@ -710,10 +766,10 @@ def _train(
                 }
                 if config.is_local_main_process:
                     train_batch_iterator_tqdm.set_postfix(**metrics_to_log)
-
-            # Checkpoint.
-            if config.should_checkpoint_this_step(step):
-                save_state(step)
+            else:
+                # Checkpoint.
+                if config.should_checkpoint_this_step(step):
+                    save_state(step)
 
         # End train loop
 
@@ -728,6 +784,10 @@ def _train(
 
     if config.is_distributed:
         dist.barrier()
+
+    # If we haven't saved a checkpoint yet, do it now.
+    if not config.best_state_path.exists():
+        save_state(step)
 
     for callback in callbacks:
         callback.post_train_loop(step, current_epoch)

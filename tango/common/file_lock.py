@@ -4,7 +4,6 @@ from typing import Optional
 
 from filelock import AcquireReturnProxy
 from filelock import FileLock as _FileLock
-from filelock import Timeout
 
 from .aliases import PathOrStr
 
@@ -24,7 +23,11 @@ class FileLock(_FileLock):  # type: ignore[valid-type,misc]
         super().__init__(str(lock_file), timeout=timeout)
         self._read_only_ok = read_only_ok
 
-    def acquire(self, timeout=None, poll_interval=0.05) -> AcquireReturnProxy:
+    def acquire(  # type: ignore[override]
+        self,
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.05,
+    ) -> AcquireReturnProxy:
         try:
             return super().acquire(timeout=timeout, poll_interval=poll_interval)
         except OSError as err:
@@ -36,35 +39,35 @@ class FileLock(_FileLock):  # type: ignore[valid-type,misc]
             if err.errno not in (1, 13, 30):
                 raise
 
-            if os.path.isfile(self._lock_file) and self._read_only_ok:
+            if os.path.isfile(self._lock_file) and self._read_only_ok:  # type: ignore
                 warnings.warn(
-                    f"Lacking permissions required to obtain lock '{self._lock_file}'. "
+                    f"Lacking permissions required to obtain lock '{self._lock_file}'. "  # type: ignore
                     "Race conditions are possible if other processes are writing to the same resource.",
                     UserWarning,
                 )
-                return None  # type: ignore[return-value]
+                return AcquireReturnProxy(self)
             else:
                 raise
 
-    def acquire_with_updates(self, desc: Optional[str] = None):
+    def acquire_with_updates(self, desc: Optional[str] = None) -> AcquireReturnProxy:
         """
         Same as :meth:`acquire()`, except that when the lock cannot be immediately acquired,
         it will keep trying and print status updates as it goes.
         """
         try:
             return self.acquire(timeout=0.1)
-        except Timeout:
+        except TimeoutError:
             pass
 
         from .tqdm import Tqdm
 
         if desc is None:
-            desc = f"acquiring lock at {self._lock_file}"
+            desc = f"acquiring lock at {self._lock_file}"  # type: ignore
 
         progress = Tqdm.tqdm(desc=desc, bar_format="{desc} [{elapsed}]")
         while True:
             progress.update()
             try:
                 return self.acquire(timeout=1)
-            except Timeout:
+            except TimeoutError:
                 continue

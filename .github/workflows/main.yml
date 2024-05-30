@@ -2,57 +2,58 @@ name: Main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 on:
   pull_request:
     branches:
-      - '*'
+      - "*"
   push:
     branches:
       - main
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
 
 env:
-  CACHE_PREFIX: v3  # Change this to invalidate existing cache.
+  CACHE_PREFIX: v5 # Change this to invalidate existing cache.
   PYTHON_PATH: ./
-  DEFAULT_PYTHON: 3.7
+  DEFAULT_PYTHON: 3.9
   WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
   BEAKER_TOKEN: ${{ secrets.BEAKER_TOKEN }}
   BEAKER_WORKSPACE: ai2/tango-testing
-  BEAKER_DEFAULT_CLUSTER: ai2/tango-gpu-tests
   BEAKER_IMAGE: petew/tango-testing
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   checks:
     name: python ${{ matrix.python }} - ${{ matrix.task.name }}
     runs-on: [ubuntu-latest]
     timeout-minutes: 30
+    permissions:
+      contents: "read"
+      id-token: "write"
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.7']
+        python: ["3.9"]
         task:
           - name: Lint
             extras: dev,all
             requires_torch: true
             run: |
-              flake8 .
+              ruff check .
 
           - name: Type check
             extras: dev,all
             requires_torch: true
             run: |
-              mypy .
+              mypy --check-untyped-defs .
 
           - name: Build
             extras: dev,all
             requires_torch: true
             run: |
               tango --version
-              python setup.py check
-              python setup.py bdist_wheel sdist
+              python -m build
 
           - name: Style
             extras: dev
@@ -85,14 +86,8 @@ jobs:
             run: |
               pytest -v --color=yes --doctest-modules tango/integrations/torch tests/integrations/torch
 
-          - name: PyTorch Lightning integration
-            extras: dev,pytorch_lightning
-            requires_torch: true
-            run: |
-              pytest -v --color=yes --doctest-modules tango/integrations/pytorch_lightning tests/integrations/pytorch_lightning
-
           - name: Transformers integration
-            extras: dev,transformers
+            extras: dev,flax,transformers
             requires_torch: true
             run: |
               pytest -v --color=yes --doctest-modules tango/integrations/transformers tests/integrations/transformers
@@ -104,10 +99,28 @@ jobs:
               pytest -v --color=yes --doctest-modules tango/integrations/fairscale tests/integrations/fairscale
 
           - name: W&B integration
-            extras: dev,torch,wandb
+            extras: dev,torch,flax,wandb
             requires_torch: true
             run: |
               pytest -v --color=yes --doctest-modules tango/integrations/wandb tests/integrations/wandb
+
+          - name: Beaker integration
+            extras: dev,beaker
+            requires_torch: false
+            run: |
+              pytest -v --color=yes --doctest-modules tango/integrations/beaker tests/integrations/beaker
+
+          - name: Flax integration
+            extras: dev,flax,transformers
+            requires_torch: false
+            run: |
+              pytest -v --color=yes --doctest-modules tango/integrations/flax tests/integrations/flax
+
+          - name: GS integration
+            extras: dev,gs
+            requires_torch: false
+            run: |
+              pytest -v --color=yes --doctest-modules tango/integrations/gs tests/integrations/gs
 
           - name: Example - train_lm
             extras: dev,all
@@ -124,7 +137,7 @@ jobs:
               requires_torch: false
               run: |
                 pytest -v --durations=10 --color=yes --doctest-modules --ignore=tests/integrations --ignore=tango/integrations tests/ tango/
-            python: '3.8'
+            python: "3.8"
 
           - task:
               name: Test
@@ -132,21 +145,24 @@ jobs:
               requires_torch: false
               run: |
                 pytest -v --durations=10 --color=yes --doctest-modules --ignore=tests/integrations --ignore=tango/integrations tests/ tango/
-            python: '3.9'
-
-          - task:
-              name: Test
-              extras: dev
-              requires_torch: false
-              run: |
-                pytest -v --durations=10 --color=yes --doctest-modules --ignore=tests/integrations --ignore=tango/integrations tests/ tango/
-            python: '3.10'
+            python: "3.10"
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: "actions/checkout@v3"
+      - name: Checkout
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v3
+
+      # For pull requests we need to checkout the HEAD commit instead of the merge
+      # commit since some tests depend on having an existing commit.
+      - name: Checkout (pull request)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python }}
 
@@ -169,18 +185,32 @@ jobs:
         id: virtualenv-cache
         with:
           path: .venv
-          key: ${{ env.CACHE_PREFIX }}-${{ env.WEEK_NUMBER }}-${{ runner.os }}-${{ env.RUNNER_ARCH }}-${{ env.PYTHON_VERSION }}-${{ env.EXTRAS_HASH }}-${{ hashFiles('*requirements.txt') }}
+          key: ${{ env.CACHE_PREFIX }}-${{ env.WEEK_NUMBER }}-${{ runner.os }}-${{ env.RUNNER_ARCH }}-${{ env.PYTHON_VERSION }}-${{ env.EXTRAS_HASH }}-${{ hashFiles('pyproject.toml') }}
 
       - name: Setup virtual environment (no cache hit)
         if: steps.virtualenv-cache.outputs.cache-hit != 'true'
         run: |
           test -d .venv || virtualenv -p $(which python) --copies --reset-app-data .venv
 
+      # Reference: https://github.com/marketplace/actions/authenticate-to-google-cloud#setup
+      - name: Authenticate to Google Cloud
+        if: matrix.task.name == 'GS integration'
+        uses: "google-github-actions/auth@v1"
+        with:
+          workload_identity_provider: "projects/10554368204/locations/global/workloadIdentityPools/tango-ci-pool/providers/tango-ci-provider"
+          service_account: "tango-service@ai2-allennlp.iam.gserviceaccount.com"
+
       - name: Pre-install torch
         if: steps.virtualenv-cache.outputs.cache-hit != 'true' && (contains(matrix.task.extras, 'torch') || contains(matrix.task.extras, 'all') || matrix.task.requires_torch)
         run: |
           . .venv/bin/activate
-          pip install torch==1.11.0+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
+          pip install torch==2.0.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Pre-install flax
+        if: steps.virtualenv-cache.outputs.cache-hit != 'true' && (contains(matrix.task.extras, 'flax') || contains(matrix.task.extras, 'all'))
+        run: |
+          . .venv/bin/activate
+          pip install flax jax jaxlib "tensorflow-cpu>=2.9.1" optax
 
       - name: Install editable (no cache hit)
         if: steps.virtualenv-cache.outputs.cache-hit != 'true'
@@ -197,9 +227,14 @@ jobs:
       - name: Show environment info
         run: |
           . .venv/bin/activate
+          echo "========= Python location ==========="
           which python
+          echo "========= Python version ============"
           python --version
+          echo "========= Python packages ==========="
           pip freeze
+          echo "========= Tango installation ========"
+          tango info
 
       - name: ${{ matrix.task.name }}
         run: |
@@ -241,17 +276,18 @@ jobs:
           echo "COMMIT_SHA=$GITHUB_SHA" >> $GITHUB_ENV
 
       - name: GPU Tests
-        uses: allenai/beaker-run-action@v1.1
+        uses: allenai/beaker-run-action@v1.2
         with:
           spec: |
             version: v2
             description: GPU Tests
+            budget: ai2/oe-training
             tasks:
               - name: tests
                 image:
                   beaker: ${{ env.BEAKER_IMAGE }}
                 context:
-                  cluster: ${{ env.BEAKER_DEFAULT_CLUSTER }}
+                  preemptible: true 
                 resources:
                   gpuCount: 2
                 envVars:
@@ -270,16 +306,18 @@ jobs:
     needs: [gpu_tests, checks]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v1  # needs v1 for now
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ env.DEFAULT_PYTHON }}
 
       - name: Install requirements
         run: |
-          pip install -r dev-requirements.txt
+          pip install -e .[dev]
 
       - name: Prepare environment
         run: |
@@ -298,12 +336,10 @@ jobs:
 
       - name: Publish package to PyPI
         run: |
-          twine upload -u allennlp -p ${{ secrets.PYPI_PASSWORD }} dist/*
+          twine upload -u __token__ -p ${{ secrets.PYPI_PASSWORD }} dist/*
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           body_path: ${{ github.workspace }}-RELEASE_NOTES.md
           prerelease: ${{ contains(env.TAG, 'rc') }}

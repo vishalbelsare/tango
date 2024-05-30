@@ -4,6 +4,7 @@ from urllib.parse import ParseResult
 
 import petname
 
+from tango.common.exceptions import StepStateError
 from tango.common.util import exception_to_string, utc_now_datetime
 from tango.step import Step
 from tango.step_cache import StepCache
@@ -73,7 +74,7 @@ class MemoryWorkspace(Workspace):
 
         existing_step_info = self.unique_id_to_info[step.unique_id]
         if existing_step_info.state != StepState.RUNNING:
-            raise RuntimeError(f"Step {step.name} is ending, but it never started.")
+            raise StepStateError(step, existing_step_info.state)
         existing_step_info.end_time = utc_now_datetime()
 
         if step.cache_results:
@@ -93,9 +94,21 @@ class MemoryWorkspace(Workspace):
         assert e is not None
         existing_step_info = self.unique_id_to_info[step.unique_id]
         if existing_step_info.state != StepState.RUNNING:
-            raise RuntimeError(f"Step {step.name} is failing, but it never started.")
+            raise StepStateError(step, existing_step_info.state)
         existing_step_info.end_time = utc_now_datetime()
         existing_step_info.error = exception_to_string(e)
+
+    def remove_step(self, step_unique_id: str) -> None:
+        """
+        Get Step unique id from the user and remove the step information from memory cache
+        :raises KeyError: If no step with the unique name found in the cache dir
+        """
+        try:
+            step_info = self.step_info(step_unique_id)
+            del self.unique_id_to_info[step_unique_id]
+            del self.step_cache[step_info]
+        except KeyError:
+            raise KeyError(f"{step_unique_id} step info not found, step cache cannot be deleted")
 
     def register_run(self, targets: Iterable[Step], name: Optional[str] = None) -> Run:
         if name is None:

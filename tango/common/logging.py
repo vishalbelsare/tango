@@ -87,17 +87,20 @@ import struct
 import sys
 import threading
 from contextlib import contextmanager
-from typing import ContextManager, Generator, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, ClassVar, ContextManager, Generator, List, Optional, Union
 
 import rich
-from rich.console import Console
-from rich.logging import RichHandler as _RichHandler
+from rich.console import Console, ConsoleRenderable, Group
+from rich.highlighter import NullHighlighter
 from rich.padding import Padding
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
 from .aliases import EnvVarNames, PathOrStr
-from .exceptions import CliRunError, SigTermReceived
+from .exceptions import CancellationError, CliRunError, SigTermReceived
 from .util import _parse_bool, _parse_optional_int
 
 FILE_FRIENDLY_LOGGING: bool = _parse_bool(
@@ -202,6 +205,8 @@ class PrefixLogFilter(logging.Filter):
         self._prefix = prefix
 
     def filter(self, record):
+        if not isinstance(record.msg, str):
+            return True
         if record.name == "tango.__main__":
             from rich.markup import escape
 
@@ -218,7 +223,7 @@ class LogRecordStreamHandler(socketserver.StreamRequestHandler):
     configured locally.
 
     Taken from
-    `the logging cookbook <https://docs.python.org/3.7/howto/logging-cookbook.html>`_.
+    `the logging cookbook <https://docs.python.org/3.8/howto/logging-cookbook.html>`_.
     """
 
     def handle(self):
@@ -257,7 +262,7 @@ class LogRecordSocketReceiver(socketserver.ThreadingTCPServer):
     Simple TCP socket-based logging receiver.
 
     Taken from
-    `the logging cookbook <https://docs.python.org/3.7/howto/logging-cookbook.html>`_.
+    `the logging cookbook <https://docs.python.org/3.8/howto/logging-cookbook.html>`_.
     """
 
     allow_reuse_address = True
@@ -285,21 +290,129 @@ _LOGGING_SERVER: Optional[LogRecordSocketReceiver] = None
 _LOGGING_SERVER_THREAD: Optional[threading.Thread] = None
 
 
-class RichHandler(_RichHandler):
+class RichHandler(logging.Handler):
+    """
+    Adapted from
+    https://github.com/Textualize/rich/blob/master/rich/logging.py
+    """
+
+    KEYWORDS: ClassVar[Optional[List[str]]] = [
+        "GET",
+        "POST",
+        "HEAD",
+        "PUT",
+        "DELETE",
+        "OPTIONS",
+        "TRACE",
+        "PATCH",
+    ]
+
+    def __init__(
+        self,
+        level: Union[int, str] = logging.NOTSET,
+        console: Optional[Console] = None,
+        *,
+        markup: bool = False,
+        log_time_format: Union[str, Callable[[datetime], str]] = "[%x %X]",
+        keywords: Optional[List[str]] = None,
+        show_time: bool = True,
+        show_level: bool = True,
+        show_path: bool = True,
+    ) -> None:
+        super().__init__(level=level)
+        self.console = console or rich.get_console()
+        self.highlighter = NullHighlighter()
+        self.time_format = log_time_format
+        self.markup = markup
+        self.keywords = keywords or self.KEYWORDS
+        self.show_time = show_time
+        self.show_level = show_level
+        self.show_path = show_path
+
     def emit(self, record: logging.LogRecord) -> None:
-        if isinstance(record.msg, Table):
-            if record.msg.title is not None:
-                attrdict = {k: v for k, v in record.__dict__.items() if k != "msg"}
-                attrdict["msg"] = "[italic]" + record.msg.title + "[/]"
-                self.emit(logging.makeLogRecord(attrdict))
-            record.msg.title = None
-            self.console.print(Padding(record.msg, (1, 0, 1, 1)))
-        elif isinstance(record.msg, Syntax):
+        if isinstance(record.msg, (Syntax, Table)):
             self.console.print(Padding(record.msg, (1, 0, 1, 1)))
         elif hasattr(record.msg, "__rich__") or hasattr(record.msg, "__rich_console__"):
             self.console.print(record.msg)
         else:
-            super().emit(record)
+            message = self.format(record)
+            message_renderable = self.render_message(record, message)
+            log_renderable = self.render(record=record, message_renderable=message_renderable)
+            try:
+                self.console.print(log_renderable)
+            except Exception:
+                self.handleError(record)
+
+    def render_message(self, record: logging.LogRecord, message: str) -> ConsoleRenderable:
+        use_markup = getattr(record, "markup", self.markup)
+        message_text = Text.from_markup(message) if use_markup else Text(message)
+        if self.show_path and record.exc_info is None:
+            message_text.end = " "
+
+        highlighter = getattr(record, "highlighter", self.highlighter)
+        if highlighter:
+            message_text = highlighter(message_text)
+
+        if self.keywords is None:
+            self.keywords = self.KEYWORDS
+
+        if self.keywords:
+            message_text.highlight_words(self.keywords, "logging.keyword")
+
+        return message_text
+
+    def get_time_text(self, record: logging.LogRecord) -> Text:
+        log_time = datetime.fromtimestamp(record.created)
+        time_str: str
+        if callable(self.time_format):
+            time_str = self.time_format(log_time)
+        else:
+            time_str = log_time.strftime(self.time_format)
+        return Text(time_str, style="log.time", end=" ")
+
+    def get_level_text(self, record: logging.LogRecord) -> Text:
+        level_name = record.levelname
+        level_text = Text.styled(level_name.ljust(8), f"logging.level.{level_name.lower()}")
+        level_text.style = "log.level"
+        level_text.end = " "
+        return level_text
+
+    def get_path_text(self, record: logging.LogRecord, length_so_far: int) -> Text:
+        path = Path(record.pathname)
+        for package_root in sys.path:
+            try:
+                path = path.relative_to(Path(package_root))
+                break
+            except ValueError:
+                continue
+        text = f"{path}:{record.lineno}"
+        length_after_wrap = length_so_far % self.console.width
+        return Text(
+            text.rjust(self.console.width - length_after_wrap - 3),
+            style="log.path",
+        )
+
+    def render(
+        self,
+        *,
+        record: logging.LogRecord,
+        message_renderable: ConsoleRenderable,
+    ) -> ConsoleRenderable:
+        components: List[ConsoleRenderable] = []
+        if self.show_time:
+            components.append(self.get_time_text(record))
+        if self.show_level:
+            components.append(self.get_level_text(record))
+        components.append(message_renderable)
+        if self.show_path and record.exc_info is None:
+            try:
+                length_so_far = sum(len(x) for x in components)  # type: ignore
+            except TypeError:
+                pass
+            else:
+                components.append(self.get_path_text(record, length_so_far))
+
+        return Group(*components)
 
 
 def get_handler(
@@ -310,27 +423,21 @@ def get_handler(
     show_level: bool = True,
     show_path: bool = True,
 ) -> logging.Handler:
-    import click
-
     console = Console(
         color_system="auto" if not FILE_FRIENDLY_LOGGING else None,
         stderr=stderr,
         width=TANGO_CONSOLE_WIDTH,
+        soft_wrap=True,
     )
     if TANGO_CONSOLE_WIDTH is None and not console.is_terminal:
         console.width = 160
     handler = RichHandler(
         level=level,
         console=console,
-        rich_tracebacks=False,
-        tracebacks_show_locals=False,
-        tracebacks_suppress=[click],
         markup=enable_markup,
         show_time=show_time,
         show_level=show_level,
         show_path=show_path,
-        omit_repeated_times=False,
-        highlighter=rich.highlighter.NullHighlighter(),
     )
     return handler
 
@@ -353,28 +460,34 @@ def excepthook(exctype, value, traceback):
     """
     Used to patch `sys.excepthook` in order to log exceptions.
     """
+    log_exc_info(exctype, value, traceback)
+
+
+def log_exception(exc: Optional[BaseException] = None, logger: Optional[logging.Logger] = None):
+    if exc is None:
+        et, ev, tb = sys.exc_info()
+        log_exc_info(et, ev, tb, logger=logger)
+    else:
+        log_exc_info(exc.__class__, exc, exc.__traceback__, logger=logger)
+
+
+def log_exc_info(exctype, value, traceback, logger: Optional[logging.Logger] = None):
     global _EXCEPTIONS_LOGGED
-    # Ignore `CliRunError` because we don't need a traceback for those.
-    if issubclass(exctype, (CliRunError,)):
-        return
-    # For interruptions, call the original exception handler.
-    if issubclass(
-        exctype,
-        (
-            KeyboardInterrupt,
-            SigTermReceived,
-        ),
-    ):
-        sys.__excepthook__(exctype, value, traceback)
-        return
     if value not in _EXCEPTIONS_LOGGED:
         _EXCEPTIONS_LOGGED.append(value)
-        root_logger = logging.getLogger()
-        root_logger.error(
-            "Uncaught exception",
-            exc_info=(exctype, value, traceback),
-            extra={"highlighter": rich.highlighter.ReprHighlighter()},
-        )
+        logger = logger or logging.getLogger()
+        if isinstance(value, CliRunError):
+            msg = str(value)
+            if msg:
+                cli_logger.error(msg)
+        elif isinstance(value, (KeyboardInterrupt, CancellationError)):
+            logger.error("%s: %s", exctype.__name__, value)
+        else:
+            logger.error(
+                "Uncaught exception",
+                exc_info=(exctype, value, traceback),
+                extra={"highlighter": rich.highlighter.ReprHighlighter()},
+            )
 
 
 def initialize_logging(
@@ -439,16 +552,21 @@ def initialize_worker_logging(worker_rank: Optional[int] = None):
     return initialize_prefix_logging(prefix=prefix, main_process=False)
 
 
-def initialize_prefix_logging(prefix: Optional[str] = None, main_process: bool = False):
+def initialize_prefix_logging(
+    *, log_level: Optional[str] = None, prefix: Optional[str] = None, main_process: bool = False
+):
     """
     Initialize logging with a prefix.
 
+    :param log_level:
+        Can be one of "debug", "info", "warning", "error". Defaults to the value
+        of :data:`TANGO_LOG_LEVEL`, if set, or "error".
     :param prefix:
         The string prefix to add to the log message.
     :param main_process:
         Whether it is for the main/worker process.
     """
-    return _initialize_logging(prefix=prefix, main_process=main_process)
+    return _initialize_logging(log_level=log_level, prefix=prefix, main_process=main_process)
 
 
 def _initialize_logging(
@@ -465,11 +583,15 @@ def _initialize_logging(
     if log_level is None:
         log_level = TANGO_LOG_LEVEL
     if log_level is None:
-        log_level = "error"
+        log_level = "warning"
     if file_friendly_logging is None:
         file_friendly_logging = FILE_FRIENDLY_LOGGING
     if enable_cli_logs is None:
         enable_cli_logs = TANGO_CLI_LOGGER_ENABLED
+    if prefix:
+        prefix = _LOGGING_PREFIX + " " + prefix if _LOGGING_PREFIX else prefix
+    else:
+        prefix = _LOGGING_PREFIX
 
     level = logging._nameToLevel[log_level.upper()]
 
@@ -528,10 +650,16 @@ def _initialize_logging(
                 cli_handler.addFilter(LevelFilter(handler_level))
                 cli_logger.addHandler(cli_handler)
 
+        # Add prefix.
+        if prefix:
+            for logger in (root_logger, cli_logger, tqdm_logger):
+                for handler in logger.handlers:
+                    handler.addFilter(PrefixLogFilter(prefix))
+
         # Main process: set formatter and handlers, initialize logging socket and server.
         # Set up logging socket to emit log records from worker processes/threads.
         # Inspired by:
-        # https://docs.python.org/3.7/howto/logging-cookbook.html#sending-and-receiving-logging-events-across-a-network
+        # https://docs.python.org/3.8/howto/logging-cookbook.html#sending-and-receiving-logging-events-across-a-network
         _LOGGING_SERVER = LogRecordSocketReceiver(_LOGGING_HOST, 0)
         _LOGGING_PORT = _LOGGING_SERVER.server_address[1]
         os.environ[EnvVarNames.LOGGING_PORT.value] = str(_LOGGING_PORT)
@@ -548,10 +676,6 @@ def _initialize_logging(
                 "did you forget to call 'initialize_logging()' from the main process?"
             )
         socket_handler = logging.handlers.SocketHandler(_LOGGING_HOST, _LOGGING_PORT)
-        if prefix:
-            prefix = _LOGGING_PREFIX + " " + prefix if _LOGGING_PREFIX else prefix
-        else:
-            prefix = _LOGGING_PREFIX
         if prefix:
             socket_handler.addFilter(PrefixLogFilter(prefix))
 
@@ -604,9 +728,10 @@ def insert_handlers(*handlers: logging.Handler) -> Generator[None, None, None]:
     try:
         yield None
     except BaseException as e:
-        # We don't log `CliRunError` because we don't need a traceback for those.
-        if not isinstance(e, CliRunError):
-            root_logger.exception(e)
+        if not isinstance(
+            e, (CliRunError, KeyboardInterrupt, SigTermReceived)
+        ):  # don't need tracebacks for these
+            log_exception(e)
             _EXCEPTIONS_LOGGED.append(e)
         raise
     finally:
@@ -637,8 +762,6 @@ def file_handler(filepath: PathOrStr) -> ContextManager[None]:
         teardown_logging()
 
     """
-    import click
-
     log_file = open(filepath, "w")
     handlers: List[logging.Handler] = []
     console = Console(
@@ -650,10 +773,7 @@ def file_handler(filepath: PathOrStr) -> ContextManager[None]:
     for is_cli_handler in (True, False):
         handler = RichHandler(
             console=console,
-            tracebacks_suppress=[click],
             markup=is_cli_handler,
-            highlighter=rich.highlighter.NullHighlighter(),
-            omit_repeated_times=False,
         )
         handler.addFilter(CliFilter(filter_out=not is_cli_handler))
         handlers.append(handler)

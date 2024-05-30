@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, Set, TypeVar, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Set, TypeVar, Union
 from urllib.parse import ParseResult
 
 import dill
@@ -11,6 +11,7 @@ import petname
 from sqlitedict import SqliteDict
 
 from tango.common import PathOrStr
+from tango.common.exceptions import StepStateError
 from tango.common.file_lock import FileLock
 from tango.common.logging import file_handler
 from tango.common.util import exception_to_string, utc_now_datetime
@@ -18,7 +19,7 @@ from tango.step import Step
 from tango.step_cache import StepCache
 from tango.step_caches import LocalStepCache
 from tango.step_info import StepInfo, StepState
-from tango.workspace import Run, StepExecutionMetadata, Workspace
+from tango.workspace import Run, StepInfoSort, Workspace
 
 logger = logging.getLogger(__name__)
 
@@ -243,11 +244,16 @@ class LocalWorkspace(Workspace):
         # messing with locks.
         step_info = self.step_info(step)
         if step_info.state not in {StepState.INCOMPLETE, StepState.FAILED}:
-            raise RuntimeError(
-                f"Step '{step.name}' is trying to start, but it is already {step_info.state}. "
-                "If you are certain the step is not running somewhere else, delete the lock "
-                f"file at {self._step_lock_file(step)}."
+            raise StepStateError(
+                step,
+                step_info.state,
+                context="If you are certain the step is not running somewhere else, delete the lock "
+                f"file at {self._step_lock_file(step)}.",
             )
+
+        if step_info.state == StepState.FAILED:
+            # Refresh environment metadata since it might be out-of-date now.
+            step_info.refresh()
 
         lock = FileLock(self._step_lock_file(step), read_only_ok=True)
         lock.acquire_with_updates(desc=f"acquiring lock for '{step.name}'")
@@ -275,36 +281,14 @@ class LocalWorkspace(Workspace):
 
         step_info = self.step_info(step)
         if step_info.state != StepState.RUNNING:
-            raise RuntimeError(f"Step '{step.name}' is ending, but it never started.")
+            raise StepStateError(step, step_info.state)
 
-        if step.cache_results:
-            self.step_cache[step] = result
-            if hasattr(result, "__next__"):
-                assert isinstance(result, Iterator)
-                # Caching the iterator will consume it, so we write it to the cache and then read from the cache
-                # for the return value.
-                result = self.step_cache[step]
-
-            # Save some metadata.
-            def replace_steps_with_unique_id(o: Any):
-                if isinstance(o, Step):
-                    return {"type": "ref", "ref": o.unique_id}
-                if isinstance(o, (list, tuple, set)):
-                    return o.__class__(replace_steps_with_unique_id(i) for i in o)
-                elif isinstance(o, dict):
-                    return {key: replace_steps_with_unique_id(value) for key, value in o.items()}
-                else:
-                    return o
-
-            try:
-                config = step.config
-            except ValueError:
-                config = None
-            metadata = StepExecutionMetadata(
-                step=step.unique_id, config=replace_steps_with_unique_id(config)
-            )
-            # Finalize metadata and save to run directory.
-            metadata.save(self.step_dir(step))
+        self.step_cache[step] = result
+        if hasattr(result, "__next__"):
+            assert isinstance(result, Iterator)
+            # Caching the iterator will consume it, so we write it to the cache and then read from the cache
+            # for the return value.
+            result = self.step_cache[step]
 
         # Mark the step as finished
         step_info.end_time = utc_now_datetime()
@@ -328,7 +312,7 @@ class LocalWorkspace(Workspace):
         try:
             step_info = self.step_info(step)
             if step_info.state != StepState.RUNNING:
-                raise RuntimeError(f"Step '{step.name}' is failing, but it never started.")
+                raise StepStateError(step, step_info.state)
             step_info.end_time = utc_now_datetime()
             step_info.error = exception_to_string(e)
             with SqliteDict(self.step_info_file) as d:
@@ -337,6 +321,20 @@ class LocalWorkspace(Workspace):
         finally:
             lock.release()
             del self.locks[step]
+
+    def remove_step(self, step_unique_id: str) -> None:
+        """
+        Get Step unique id from the user and remove the step information from cache
+        :raises KeyError: If no step with the unique name found in the cache dir
+        """
+        with SqliteDict(self.step_info_file) as d:
+            try:
+                step_info = self.step_info(step_unique_id)
+                del d[step_unique_id]
+                d.commit()
+                del self.cache[step_info]
+            except KeyError:
+                raise KeyError(f"No step named '{step_unique_id}' found")
 
     def register_run(self, targets: Iterable[Step], name: Optional[str] = None) -> Run:
         # sanity check targets
@@ -366,9 +364,7 @@ class LocalWorkspace(Workspace):
                 target_path = self.step_dir(target)
                 (run_dir / target.name).symlink_to(os.path.relpath(target_path, run_dir))
 
-        # Note: Python3.7 pathlib.Path.unlink does not support the `missing_ok` argument.
-        if self.latest_dir.is_symlink():
-            self.latest_dir.unlink()
+        self.latest_dir.unlink(missing_ok=True)
         self.latest_dir.symlink_to(run_dir)
 
         return self.registered_run(name)
@@ -379,6 +375,38 @@ class LocalWorkspace(Workspace):
             for run_dir in self.runs_dir.iterdir()
             if run_dir.is_dir()
         }
+
+    def search_step_info(
+        self,
+        *,
+        sort_by: Optional[StepInfoSort] = None,
+        sort_descending: bool = True,
+        match: Optional[str] = None,
+        state: Optional[StepState] = None,
+        start: int = 0,
+        stop: Optional[int] = None,
+    ) -> List[StepInfo]:
+        with SqliteDict(self.step_info_file, flag="r") as d:
+            steps = [
+                step
+                for step in d.values()
+                if (match is None or match in step.unique_id)
+                and (state is None or step.state == state)
+            ]
+
+        if sort_by == StepInfoSort.START_TIME:
+            now = utc_now_datetime()
+            steps = sorted(
+                steps,
+                key=lambda step: step.start_time or now,
+                reverse=sort_descending,
+            )
+        elif sort_by == StepInfoSort.UNIQUE_ID:
+            steps = sorted(steps, key=lambda step: step.unique_id, reverse=sort_descending)
+        elif sort_by is not None:
+            raise NotImplementedError
+
+        return steps[slice(start, stop)]
 
     def registered_run(self, name: str) -> Run:
         run_dir = self.runs_dir / name

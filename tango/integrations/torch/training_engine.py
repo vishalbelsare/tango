@@ -2,7 +2,7 @@ import os
 import tempfile
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Tuple, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -35,7 +35,7 @@ class TrainingEngine(Registrable):
     def __init__(
         self,
         train_config: TrainConfig,
-        model: Lazy[Model],
+        model: Union[Model, Lazy[Model]],
         optimizer: Lazy[Optimizer],
         *,
         lr_scheduler: Optional[Lazy[LRScheduler]] = None,
@@ -47,8 +47,9 @@ class TrainingEngine(Registrable):
         if lr_scheduler is not None:
             self.lr_scheduler = self._construct_lr_scheduler(lr_scheduler)
 
-    def _construct_model(self, model: Lazy[Model]) -> Model:
-        model: Model = model.construct()
+    def _construct_model(self, model: Union[Model, Lazy[Model]]) -> Model:
+        if isinstance(model, Lazy):
+            model = model.construct()
         return model.to(self.train_config.worker_local_default_device)
 
     def _construct_optimizer(self, optimizer: Lazy[Optimizer]) -> Optimizer:
@@ -62,7 +63,7 @@ class TrainingEngine(Registrable):
     @abstractmethod
     def forward_train(
         self, micro_batch: Dict[str, Any], micro_batch_idx: int, num_micro_batches: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Run a forward training pass on the model.
         """
@@ -142,7 +143,7 @@ class TorchTrainingEngine(TrainingEngine):
     def __init__(
         self,
         train_config: TrainConfig,
-        model: Lazy[Model],
+        model: Union[Model, Lazy[Model]],
         optimizer: Lazy[Optimizer],
         *,
         lr_scheduler: Optional[Lazy[LRScheduler]] = None,
@@ -178,8 +179,9 @@ class TorchTrainingEngine(TrainingEngine):
 
         super().__init__(train_config, model, optimizer, lr_scheduler=lr_scheduler)
 
-    def _construct_model(self, model: Lazy[Model]) -> Model:
-        model: Model = model.construct()
+    def _construct_model(self, model: Union[Model, Lazy[Model]]) -> Model:
+        if isinstance(model, Lazy):
+            model = model.construct()
         model.to(self.train_config.worker_local_default_device)
         # Wrap model with DDP wrapper.
         if self.train_config.is_distributed:
@@ -188,7 +190,7 @@ class TorchTrainingEngine(TrainingEngine):
 
     def forward_train(
         self, micro_batch: Dict[str, Any], micro_batch_idx: int, num_micro_batches: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if micro_batch_idx == 0:
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -199,7 +201,7 @@ class TorchTrainingEngine(TrainingEngine):
             outputs = self.model(**micro_batch)
             micro_batch_loss = outputs["loss"] / num_micro_batches
 
-        return micro_batch_loss
+        return micro_batch_loss, outputs
 
     def forward_eval(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         # Move tensors to right device.

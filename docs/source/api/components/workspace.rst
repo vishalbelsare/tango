@@ -20,14 +20,14 @@ Metadata
 .. autoclass:: tango.workspace.Run
    :members:
 
-.. autoclass:: tango.workspace.StepExecutionMetadata
+.. autoclass:: tango.workspace.RunInfo
    :members:
 
-.. autoclass:: tango.workspace.TangoMetadata
+Miscellaneous
+-------------
+
+.. autoclass:: tango.workspace.RunSort
    :members:
 
-.. autoclass:: tango.workspace.PlatformMetadata
-   :members:
-
-.. autoclass:: tango.workspace.GitMetadata
+.. autoclass:: tango.workspace.StepInfoSort
    :members:

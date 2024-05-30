@@ -123,15 +123,17 @@ class Registrable(FromParams):
                     ...  # construct some_params from files
                     return cls(some_params)
         """
+
+        if _cls_is_step(cls) and name == "ref":
+            raise ConfigurationError(
+                "You cannot use the name 'ref' to register a step. This name is reserved."
+            )
+
         registry = Registrable._registry[cls]
 
         def add_subclass_to_registry(subclass: Type[_T]) -> Type[_T]:
             # Add to registry, raise an error if key has already been used.
             if name in registry:
-
-                def fullname(c: type) -> str:
-                    return f"{c.__module__}.{c.__qualname__}"
-
                 already_in_use_for = registry[name][0]
                 if already_in_use_for.__module__ == "__main__":
                     # Sometimes the same class shows up under module.submodule.Class and __main__.Class, and we
@@ -143,15 +145,15 @@ class Registrable(FromParams):
                     return already_in_use_for
                 elif exist_ok:
                     message = (
-                        f"Registering {fullname(subclass)} as a {fullname(cls)} under the name {name} overwrites "
-                        f"existing entry {fullname(already_in_use_for)}, which is fine because you said "
-                        "exist_ok=True."
+                        f"Registering {_fullname(subclass)} as a {_fullname(cls)} under the name {name} "
+                        f"overwrites existing entry {_fullname(already_in_use_for)}, which is fine because "
+                        "you said exist_ok=True."
                     )
                     logger.info(message)
                 else:
                     message = (
-                        f"Attempting to register {fullname(subclass)} as a {fullname(cls)} under the name "
-                        f"'{name}' failed. {fullname(already_in_use_for)} is already registered under that name."
+                        f"Attempting to register {_fullname(subclass)} as a {_fullname(cls)} under the name "
+                        f"'{name}' failed. {_fullname(already_in_use_for)} is already registered under that name."
                     )
                     raise ConfigurationError(message)
             registry[name] = (subclass, constructor)
@@ -178,12 +180,16 @@ class Registrable(FromParams):
         """
         Search for and import modules where ``name`` might be registered.
         """
-        if could_be_class_name(name) or name in Registrable._registry[cls]:
+        if (
+            could_be_class_name(name)
+            or name in Registrable._registry[cls]
+            or (_cls_is_step(cls) and name == "ref")
+        ):
             return None
 
-        def try_import(module):
+        def try_import(module, recursive: bool = True):
             try:
-                import_module_and_submodules(module)
+                import_module_and_submodules(module, recursive=recursive)
             except IntegrationMissingError:
                 pass
             except ImportError as e:
@@ -193,28 +199,55 @@ class Registrable(FromParams):
         integrations = {m.split(".")[-1]: m for m in find_integrations()}
         integrations_imported: Set[str] = set()
         if name in integrations:
-            try_import(integrations[name])
+            try_import(integrations[name], recursive=False)
             integrations_imported.add(name)
             if name in Registrable._registry[cls]:
                 return None
 
         if "::" in name:
+            # Try to guess the integration that it comes from.
             maybe_integration = name.split("::")[0]
             if maybe_integration in integrations:
-                try_import(integrations[maybe_integration])
+                try_import(integrations[maybe_integration], recursive=False)
                 integrations_imported.add(maybe_integration)
                 if name in Registrable._registry[cls]:
                     return None
 
+        # Check Python files and modules in the current directory.
+        from glob import glob
+        from pathlib import Path
+
+        for pyfile in glob("*.py"):
+            module = str(Path(pyfile).with_suffix(""))
+            if module == "setup":
+                continue
+            try:
+                try_import(module)
+                if name in Registrable._registry[cls]:
+                    return None
+            except:  # noqa: E722
+                continue
+        for pyinit in glob("**/__init__.py"):
+            module = str(Path(pyinit).parent)
+            if module == "tango" or module.startswith("test"):
+                continue
+            try:
+                try_import(module)
+                if name in Registrable._registry[cls]:
+                    return None
+            except:  # noqa: E722
+                continue
+
+        # Search all other modules in Tango.
         for module in find_submodules(exclude={"tango.integrations*"}, recursive=False):
             try_import(module)
             if name in Registrable._registry[cls]:
                 return None
 
-        # If we still haven't found the registered 'name', try importing all other integrations.
+        # Try importing all other integrations.
         for integration_name, module in integrations.items():
             if integration_name not in integrations_imported:
-                try_import(module)
+                try_import(module, recursive=False)
                 integrations_imported.add(integration_name)
                 if name in Registrable._registry[cls]:
                     return None
@@ -281,7 +314,7 @@ class Registrable(FromParams):
                 + "If your registered class comes from custom code, you'll need to import "
                 "the corresponding modules. If you're using Tango or AllenNLP from the command-line, "
                 "this is done by using the '--include-package' flag, or by specifying your imports "
-                "in a '.allennlp_plugins' file. "
+                "in a 'tango.yml' settings file. "
                 "Alternatively, you can specify your choices "
                 """using fully-qualified paths, e.g. {"model": "my_module.models.MyModel"} """
                 "in which case they will be automatically imported correctly."
@@ -306,6 +339,38 @@ class Registrable(FromParams):
             return [default] + [k for k in keys if k != default]
 
 
+class RegistrableFunction(Registrable):
+    """
+    A registrable class mimicking a `Callable`. This is to allow
+    referring to functions by their name in tango configurations.
+    """
+
+    WRAPPED_FUNC: ClassVar[Callable]
+
+    def __call__(self, *args, **kwargs):
+        return self.__class__.WRAPPED_FUNC(*args, **kwargs)
+
+
+def make_registrable(name: Optional[str] = None, *, exist_ok: bool = False):
+    """
+    A decorator to create a :class:`RegistrableFunction` from a function.
+
+    :param name: A name to register the function under. By default the name of the function is used.
+    :param exist_ok:
+        If True, overwrites any existing function registered under the same ``name``. Else,
+        throws an error if a function is already registered under ``name``.
+    """
+
+    def function_wrapper(func):
+        @RegistrableFunction.register(name or func.__name__, exist_ok=exist_ok)
+        class WrapperFunc(RegistrableFunction):
+            WRAPPED_FUNC = func
+
+        return WrapperFunc()
+
+    return function_wrapper
+
+
 def _get_suggestion(name: str, available: List[str]) -> Optional[str]:
     # Check for simple mistakes like using '-' instead of '_', or vice-versa.
     for ch, repl_ch in (("_", "-"), ("-", "_")):
@@ -313,3 +378,14 @@ def _get_suggestion(name: str, available: List[str]) -> Optional[str]:
         if suggestion in available:
             return suggestion
     return None
+
+
+def _fullname(c: type) -> str:
+    return f"{c.__module__}.{c.__qualname__}"
+
+
+def _cls_is_step(c: type) -> bool:
+    # NOTE (epwalsh): importing the actual Step class here would result in a circular
+    # import, even though the import wouldn't be at the top of the module (believe me, I've tried).
+    # So instead we just check the fully qualified name of the class.
+    return _fullname(c) == "tango.step.Step"

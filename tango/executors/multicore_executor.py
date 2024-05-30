@@ -5,7 +5,7 @@ import time
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, OrderedDict, Sequence, Set, TypeVar
 
-from tango.executor import Executor, ExecutorOutput
+from tango.executor import ExecutionMetadata, Executor, ExecutorOutput
 from tango.step import Step
 from tango.step_graph import StepGraph
 from tango.step_info import StepState
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+@Executor.register("multicore")
 class MulticoreExecutor(Executor):
     """
     A ``MulticoreExecutor`` runs the steps in parallel and caches their results.
@@ -25,13 +26,14 @@ class MulticoreExecutor(Executor):
         self,
         workspace: Workspace,
         include_package: Optional[Sequence[str]] = None,
-        parallelism: int = 1,
+        parallelism: Optional[int] = 1,
         num_tries_to_sync_states: int = 3,
         wait_seconds_to_sync_states: int = 3,
     ) -> None:
-        self.workspace = workspace
-        self.include_package = include_package
-        self.parallelism = parallelism
+        super().__init__(workspace, include_package=include_package, parallelism=parallelism or 1)
+        assert self.parallelism is not None
+        if self.parallelism < 0:
+            self.parallelism = min(32, os.cpu_count() or 1)
 
         # Perhaps there's a better way to do this without these being passed as args.
         self._num_tries_to_sync_states = num_tries_to_sync_states
@@ -47,8 +49,8 @@ class MulticoreExecutor(Executor):
         """
 
         _running: OrderedDict[str, subprocess.Popen] = OrderedDict({})
-        _successful: Set[str] = set()
-        _failed: Set[str] = set()
+        _successful: Dict[str, ExecutionMetadata] = {}
+        _failed: Dict[str, ExecutionMetadata] = {}
         _queued_steps: List[str] = []
 
         uncacheable_leaf_steps = step_graph.uncacheable_leaf_steps()
@@ -134,8 +136,12 @@ class MulticoreExecutor(Executor):
                     if step_states[step_name] == StepState.RUNNING:
                         step_states[step_name] = self._get_state(step_graph[step_name])
 
-                    # We check for uncacheable leaf step too.
-                    if step_states[step_name] in [StepState.COMPLETED, StepState.UNCACHEABLE]:
+                    if step_states[step_name] == StepState.UNCACHEABLE:
+                        if poll_status == 0:
+                            done.append(step_name)
+                        else:
+                            errors.append(step_name)
+                    elif step_states[step_name] == StepState.COMPLETED:
                         done.append(step_name)
                     elif (
                         step_states[step_name] == StepState.FAILED
@@ -155,10 +161,15 @@ class MulticoreExecutor(Executor):
                 _running.pop(step_name)
 
             for step_name in done:
-                _successful.add(step_name)
+                step = step_graph[step_name]
+                _successful[step_name] = ExecutionMetadata(
+                    result_location=None
+                    if not step.cache_results
+                    else self.workspace.step_info(step).result_location
+                )
 
             for step_name in errors:
-                _failed.add(step_name)
+                _failed[step_name] = ExecutionMetadata()
 
             return errors
 
@@ -216,7 +227,7 @@ class MulticoreExecutor(Executor):
             if len(_queued_steps) == 0:
                 logger.debug("No steps in queue!")
                 return
-            if len(_running) < self.parallelism:
+            if len(_running) < (self.parallelism or 1):
                 step_name = _queued_steps.pop(0)
                 command: List[str] = [
                     "tango",
@@ -227,7 +238,6 @@ class MulticoreExecutor(Executor):
                     step_name,
                     "-w",
                     self.workspace.url,
-                    "--no-server",
                 ]
                 if self.include_package is not None:
                     for package in self.include_package:
@@ -238,7 +248,7 @@ class MulticoreExecutor(Executor):
                 _running[step_name] = process
             else:
                 logger.debug(
-                    f"{self.parallelism} steps are already running. Will attempt to execute later."
+                    f"{self.parallelism or 1} steps are already running. Will attempt to execute later."
                 )
 
         # Creates a temporary file in which to store the config. This is passed as a command line
@@ -262,14 +272,14 @@ class MulticoreExecutor(Executor):
                     _queue_step(step_name)
 
                 # Begin processes for any queued steps (if not enough processes are already running).
-                while len(_queued_steps) > 0 and len(_running) < self.parallelism:
+                while len(_queued_steps) > 0 and len(_running) < (self.parallelism or 1):
                     _try_to_execute_next_step(config_path=file_ref.name, run_name=run_name)
 
                 # Re-sync the StepState info.
                 step_states = _sync_step_states()
 
         assert not _running and not _queued_steps
-        _not_run = set()
+        _not_run: Dict[str, ExecutionMetadata] = {}
         for step_name, step in step_graph.items():
             if step_name in _successful or step_name in _failed:
                 # tried to execute directly
@@ -277,10 +287,23 @@ class MulticoreExecutor(Executor):
             elif not step.cache_results and step not in uncacheable_leaf_steps:
                 # uncacheable interior step; didn't execute directly.
                 continue
+            elif (
+                step.cache_results
+                and step_name in step_states
+                and step_states[step_name] == StepState.COMPLETED
+            ):
+                # step result was found in cache.
+                # NOTE: since neither `Step.result()` nor `Step.ensure_result()` will have been
+                # called, we invoke the CLI logger here to let users know that we didn't run this
+                # step because we found it in the cache.
+                step.log_cache_hit()
+                _successful[step_name] = ExecutionMetadata(
+                    result_location=self.workspace.step_info(step_graph[step_name]).result_location
+                )
             else:
                 # step wasn't executed because parents failed, or
                 # step is uncacheable leaf step, so we do care about what happened to it.
-                _not_run.add(step_name)
+                _not_run[step_name] = ExecutionMetadata()
 
         return ExecutorOutput(successful=_successful, failed=_failed, not_run=_not_run)
 

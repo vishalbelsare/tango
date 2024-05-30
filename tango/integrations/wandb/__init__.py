@@ -41,3 +41,14 @@ else:
     from .torch_train_callback import WandbTrainCallback
 
     __all__.append("WandbTrainCallback")
+
+try:
+    import flax
+    import jax
+    import tensorflow  # flax has a tensorflow dependency
+except ModuleNotFoundError:
+    pass
+else:
+    from .flax_train_callback import WandbFlaxTrainCallback
+
+    __all__.append("WandbFlaxTrainCallback")

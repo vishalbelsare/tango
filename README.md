@@ -31,38 +31,83 @@ AI2 Tango replaces messy directories and spreadsheets full of file versions by o
 - [Contributing](https://github.com/allenai/tango/blob/main/CONTRIBUTING.md)
 - [License](https://github.com/allenai/tango/blob/main/LICENSE)
 
+## In this README
+
+- [Quick start](#quick-start)
+- [Installation](#installation)
+  - [Installing with PIP](#installing-with-pip)
+  - [Installing with Conda](#installing-with-conda)
+  - [Installing from source](#installing-from-source)
+  - [Checking your installation](#checking-your-installation)
+  - [Docker image](#docker-image)
+- [FAQ](#faq)
+- [Team](#team)
+- [License](#license)
+
+## Quick start
+
+Create a Tango step:
+
+```python
+# hello.py
+
+from tango import step
+
+@step()
+def hello(name: str) -> str:
+    message = f"Hello, {name}!"
+    print(message)
+    return message
+```
+
+And create a corresponding experiment configuration file:
+
+```jsonnet
+// hello.jsonnet
+
+{
+  steps: {
+    hello: {
+      type: "hello",
+      name: "World",
+    }
+  }
+}
+```
+
+Then run the experiment using a local workspace to cache the result:
+
+```bash
+tango run hello.jsonnet -w /tmp/workspace
+```
+
+You'll see something like this in the output:
+
+```
+Starting new run expert-llama
+● Starting step "hello"...
+Hello, World!
+✓ Finished step "hello"
+✓ Finished run expert-llama
+```
+
+If you run this a second time the output will now look like this:
+
+```
+Starting new run open-crab
+✓ Found output for step "hello" in cache...
+✓ Finished run open-crab
+```
+
+You won't see "Hello, World!" this time because the result of the step was found in the cache, so it wasn't run again.
+
+For a more detailed introduction check out the [First Steps](https://ai2-tango.readthedocs.io/en/latest/first_steps.html) walk-through.
+
 ## Installation
 
 <!-- start install -->
 
-**ai2-tango** requires Python 3.7 or later.
-
-### Installing with `conda`
-
-**ai2-tango** is available on conda-forge. You can install just the base package with
-
-```bash
-conda install tango -c conda-forge
-```
-
-You can pick and choose from the integrations with one of these:
-
-```bash
-conda install tango-datasets -c conda-forge
-conda install tango-pytorch_lightning -c conda-forge
-conda install tango-torch -c conda-forge
-conda install tango-wandb -c conda-forge
-```
-
-You can also install everything:
-
-```bash
-conda install tango-all -c conda-forge
-```
-
-Even though **ai2-tango** itself is quite small, installing everything will pull in a lot of dependencies.
-Don't be surprised if this takes a while!
-
+**ai2-tango** requires Python 3.8 or later.
 
 ### Installing with `pip`
 
@@ -84,6 +129,30 @@ To install with all integrations, run
 pip install 'ai2-tango[all]'
 ```
 
+### Installing with `conda`
+
+**ai2-tango** is available on conda-forge. You can install just the base package with
+
+```bash
+conda install tango -c conda-forge
+```
+
+You can pick and choose from the integrations with one of these:
+
+```bash
+conda install tango-datasets -c conda-forge
+conda install tango-torch -c conda-forge
+conda install tango-wandb -c conda-forge
+```
+
+You can also install everything:
+
+```bash
+conda install tango-all -c conda-forge
+```
+
+Even though **ai2-tango** itself is quite small, installing everything will pull in a lot of dependencies.
+Don't be surprised if this takes a while!
 
 ### Installing from source
 
@@ -113,7 +182,6 @@ pip install -e .
 ```
 
 ### Checking your installation
-
 
 Run
 
@@ -156,6 +224,30 @@ You can see a list of all available image tags [on GitHub](https://github.com/al
 ### Why is the library named Tango?
 
 The motivation behind this library is that we can make research easier by composing it into well-defined steps.  What happens when you choreograph a number of steps together?  Well, you get a dance.  And since our [team's leader](https://nasmith.github.io/) is part of a tango band, "AI2 Tango" was an obvious choice!
+
+### How can I debug my steps through the Tango CLI?
+
+You can run the `tango` command through [pdb](https://docs.python.org/3/library/pdb.html). For example:
+
+```bash
+python -m pdb -m tango run config.jsonnet
+```
+
+### How is Tango different from [Metaflow](https://metaflow.org), [Airflow](https://airflow.apache.org), or [redun](https://github.com/insitro/redun)?
+
+We've found that existing DAG execution engines like these tools are great for production workflows but not as well suited for messy, collaborative research projects
+where code is changing constantly. AI2 Tango was built *specifically* for these kinds of research projects.
+
+### How does Tango's caching mechanism work?
+
+AI2 Tango caches the results of steps based on the `unique_id` of the step. The `unique_id` is essentially a hash of all of the inputs to the step along with:
+
+1. the step class's fully qualified name, and
+2. the step class's `VERSION` class variable (an arbitrary string).
+
+Unlike other workflow engines like [redun](https://github.com/insitro/redun), Tango does *not* take into account the source code of the class itself (other than its fully qualified name) because we've found that using a hash of the source code bytes is way too sensitive and less transparent for users.
+When you change the source code of your step in a meaningful way you can just manually change the `VERSION` class variable to indicate to Tango
+that the step has been updated.
 
 <!-- end faq -->
 

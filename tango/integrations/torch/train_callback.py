@@ -151,7 +151,9 @@ class TrainCallback(Registrable):
         """
         pass
 
-    def post_batch(self, step: int, epoch: int, batch_loss: float) -> None:
+    def post_batch(
+        self, step: int, epoch: int, batch_loss: float, batch_outputs: List[Dict[str, Any]]
+    ) -> None:
         """
         Called directly after processing a batch, but before unscaling gradients,
         clipping gradients, and taking an optimizer step.
@@ -162,10 +164,16 @@ class TrainCallback(Registrable):
 
             If you need the average loss, use :meth:`log_batch()`.
 
+        .. note::
+            A type of ``batch_outputs`` is a list because with gradient accumulation there will
+            more than one "micro batch" in the batch.
+
         """
         pass
 
-    def log_batch(self, step: int, epoch: int, batch_loss: float) -> None:
+    def log_batch(
+        self, step: int, epoch: int, batch_loss: float, batch_outputs: List[Dict[str, Any]]
+    ) -> None:
         """
         Called after the optimizer step. Here ``batch_loss`` is the average loss across
         all distributed workers.
@@ -174,6 +182,10 @@ class TrainCallback(Registrable):
             This callback method is not necessarily called on every step.
             The frequency depends on the value of the ``log_every`` parameter of
             :class:`TorchTrainStep`.
+
+        .. note::
+            A type of ``batch_outputs`` is a list because with gradient accumulation there will
+            more than one "micro batch" in the batch.
 
         """
         pass
@@ -225,12 +237,16 @@ class StopEarlyCallback(TrainCallback):
         super().__init__(*args, **kwargs)
         self.patience = patience
         self.best_step = 0
+        self.best_val_metric: Optional[float] = None
 
     def post_val_loop(
         self, step: int, epoch: int, val_metric: float, best_val_metric: float
     ) -> None:
-        if val_metric == best_val_metric:
+        # We can't rely on the best_val_metric parameter, because then we can't detect when the metric stays
+        # the same for many steps.
+        if self.best_val_metric is None or val_metric > self.best_val_metric:
             self.best_step = step
+            self.best_val_metric = val_metric
         elif step > self.best_step + self.patience:
             raise StopEarly
 
@@ -238,7 +254,11 @@ class StopEarlyCallback(TrainCallback):
         """
         Return any state that needs to be kept after a restart.
         """
-        return {"patience": self.patience, "best_step": self.best_step}
+        return {
+            "patience": self.patience,
+            "best_step": self.best_step,
+            "best_val_metric": self.best_val_metric,
+        }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """
@@ -246,3 +266,4 @@ class StopEarlyCallback(TrainCallback):
         """
         self.patience = state_dict["patience"]
         self.best_step = state_dict["best_step"]
+        self.best_val_metric = state_dict["best_val_metric"]

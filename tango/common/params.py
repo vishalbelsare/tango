@@ -10,25 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, TypeVar, Union
 
 import yaml
-
-# _jsonnet doesn't work on Windows, so we have to use fakes.
-try:
-    from _jsonnet import evaluate_file, evaluate_snippet
-except ImportError:
-
-    def evaluate_file(filename: str, **_kwargs) -> str:
-        logger.warning(
-            f"error loading _jsonnet (this is expected on Windows), treating {filename} as plain json"
-        )
-        with open(filename, "r") as evaluation_file:
-            return evaluation_file.read()
-
-    def evaluate_snippet(_filename: str, expr: str, **_kwargs) -> str:
-        logger.warning(
-            "error loading _jsonnet (this is expected on Windows), treating snippet as plain json"
-        )
-        return expr
-
+from rjsonnet import evaluate_file, evaluate_snippet
 
 from .aliases import PathOrStr
 from .exceptions import ConfigurationError
@@ -191,9 +173,11 @@ def pop_choice(
 
 
 def _replace_none(params: Any) -> Any:
-    if params == "None":
+    if isinstance(params, str) and params == "None":
         return None
-    elif isinstance(params, dict):
+    elif isinstance(params, (dict, Params)):
+        if isinstance(params, Params):
+            params = params.as_dict(quiet=True)
         for key, value in params.items():
             params[key] = _replace_none(value)
         return params
@@ -253,7 +237,6 @@ class Params(MutableMapping):
         self.history = history
 
     def pop(self, key: str, default: Any = DEFAULT, keep_as_dict: bool = False) -> Any:
-
         """
         Performs the functionality associated with ``dict.pop(key)``, along with checking for
         returned dictionaries, replacing them with Param objects with an updated history
@@ -472,7 +455,7 @@ class Params(MutableMapping):
         cls,
         params_file: PathOrStr,
         params_overrides: Union[str, Dict[str, Any]] = "",
-        ext_vars: dict = None,
+        ext_vars: Optional[dict] = None,
     ) -> "Params":
         """
         Load a ``Params`` object from a configuration file.
@@ -500,6 +483,8 @@ class Params(MutableMapping):
         from cached_path import cached_path
 
         params_file: Path = Path(cached_path(params_file))
+        if not params_file.is_file():
+            raise FileNotFoundError(params_file)
 
         file_dict: Dict[str, Any]
         if params_file.suffix in {".yml", ".yaml"}:
@@ -508,7 +493,8 @@ class Params(MutableMapping):
         else:
             # Fall back to JSON/Jsonnet.
             ext_vars = {**_environment_variables(), **ext_vars}
-            file_dict = json.loads(evaluate_file(str(params_file), ext_vars=ext_vars))
+            json_str = evaluate_file(params_file.name, str(params_file.parent), ext_vars=ext_vars)
+            file_dict = json.loads(json_str)
 
         if isinstance(params_overrides, dict):
             params_overrides = json.dumps(params_overrides)
@@ -521,14 +507,16 @@ class Params(MutableMapping):
 
         return cls(param_dict)
 
-    def to_file(self, params_file: PathOrStr, preference_orders: List[List[str]] = None) -> None:
+    def to_file(
+        self, params_file: PathOrStr, preference_orders: Optional[List[List[str]]] = None
+    ) -> None:
         """
         Write the params to file.
         """
         with open(params_file, "w") as handle:
             json.dump(self.as_ordered_dict(preference_orders), handle, indent=4)
 
-    def as_ordered_dict(self, preference_orders: List[List[str]] = None) -> OrderedDict:
+    def as_ordered_dict(self, preference_orders: Optional[List[List[str]]] = None) -> OrderedDict:
         """
         Returns an ``OrderedDict`` of ``Params`` from list of partial order preferences.
 
